@@ -367,7 +367,8 @@ def generate_simulated_datasets(dataframe, data_dir, iterations,
                                     'cross-validated-taxa',
                                     'cross-validated-trad',
                                     'novel-taxa',
-                                )):
+                                ),
+                                trad_cv_query_size=None):
     '''From a dataframe of sequence reference databases, build training/test
     sets of "novel taxa" queries, taxonomies, and reference seqs/taxonomies.
 
@@ -406,10 +407,26 @@ def generate_simulated_datasets(dataframe, data_dir, iterations,
     simulation_method : str or iterable of str, optional
         Any combination of simulation builders to run. Supported values are
         ``cross-validated-taxa`` (original cross-validated behavior with
-        taxonomy-aware trimming), ``cross-validated-trad`` (random KFold split
-        with untrimmed test taxonomies), and ``novel-taxa``. Default runs all
+        taxonomy-aware trimming), ``cross-validated-trad`` (random split with
+        untrimmed test taxonomies), and ``novel-taxa``. Default runs all
         three. For backward compatibility, ``cross-validated`` is accepted as
         an alias of ``cross-validated-taxa``.
+    trad_cv_query_size : float, int, or None, optional
+        Size of the **total** ``cross-validated-trad`` query pool, divided
+        evenly between the ``iterations`` folds. A **float** in ``(0, 1]`` is
+        a **fraction** of the database; an **int** is an **absolute number of
+        sequences**. Both describe the total across all folds: with
+        ``trad_cv_query_size=0.2`` and ``iterations=8``, 20% of the database
+        is queried in total and each fold holds 2.5% of it. ``None``
+        (default) uses the whole database as the pool, so each fold holds
+        ``n_sequences / iterations`` sequences. An int larger than a given
+        database warns and falls back to that whole database, so one int can
+        be shared across databases of different sizes. Ignored unless
+        ``cross-validated-trad`` is in ``simulation_method``. See
+        :func:`generate_cross_validated_trad_sequences`.
+
+        Changing this value does not by itself invalidate fold directories
+        that already exist on disk; pass ``force=True`` to rebuild them.
     '''
     allowed_methods = {
         'cross-validated-taxa',
@@ -509,7 +526,7 @@ def generate_simulated_datasets(dataframe, data_dir, iterations,
         if make_cv_trad:
             generate_cross_validated_trad_sequences(
                 clean_taxa, simulated_reads_fp, index, iterations, cv_trad_dir,
-                force=force)
+                force=force, query_size=trad_cv_query_size)
 
         # Generate novel query and reference seqs/taxa pairs
         if make_novel:
@@ -827,6 +844,83 @@ def generate_cross_validated_sequences(read_taxa, simulated_reads_fp, index,
         artifact.save(ref_taxa_fp[:-3] + 'qza')
 
 
+_QUERY_SIZE_MEANING = (
+    'query_size is the TOTAL pool of query sequences, divided evenly between '
+    'the iterations. A float in (0, 1] means a FRACTION of the database (0.2 '
+    'means 20% of sequences in total, so 20%/iterations per fold); an int '
+    'means an ABSOLUTE NUMBER of sequences (10 means 10 sequences in total, '
+    'not 10% and not 10 per fold).')
+
+
+def _resolve_query_pool_size(query_size, n_sequences, iterations, index):
+    '''Resolve a ``cross-validated-trad`` query pool size to a sequence count.
+
+    *query_size* is the total number of sequences queried across all folds:
+    a float in ``(0, 1]`` as a fraction of the database, or an int as an
+    absolute count. Returns that count as an int, or raises ``ValueError``
+    naming both readings, since ``0.2`` and ``20`` mean very different things.
+
+    An int larger than the database is **not** an error: a warning is printed
+    and the whole database is used, so one int can be shared across databases
+    of different sizes. The pool must still hold at least one sequence per
+    fold, so the resolved count is required to be >= *iterations*.
+    '''
+    # bool is a subclass of int; reject it before the int branch accepts True.
+    if isinstance(query_size, bool):
+        raise ValueError(
+            '{0}: query_size must be a float or an int, got bool {1!r}. '
+            '{2}'.format(index, query_size, _QUERY_SIZE_MEANING))
+    if isinstance(query_size, int):
+        n_pool = query_size
+        if n_pool < 1:
+            raise ValueError(
+                '{0}: query_size={1} sequences is out of range; an int '
+                'query_size must be at least 1. {2}'.format(
+                    index, query_size, _QUERY_SIZE_MEANING))
+        if n_pool > n_sequences:
+            # Asking for more sequences than the database holds is expected
+            # when one int is used to equalize query counts across databases
+            # of different sizes; fall back to the whole database.
+            print('WARNING: {0}: query_size={1} exceeds the {2} sequences in '
+                  'this database; querying the entire database ({2} sequences) '
+                  'instead. Query counts will not match databases large enough '
+                  'to supply {1} sequences.'.format(
+                      index, query_size, n_sequences))
+            n_pool = n_sequences
+    elif isinstance(query_size, float):
+        if not 0 < query_size <= 1:
+            hint = ''
+            if query_size > 1:
+                hint = (' To query {0:.0f} sequences in total, pass the int '
+                        '{0:.0f} instead.'.format(query_size))
+            raise ValueError(
+                '{0}: query_size={1} is out of range; a float query_size must '
+                'be greater than 0 and at most 1 (1.0 means the whole '
+                'database, which is the default). {2}{3}'.format(
+                    index, query_size, _QUERY_SIZE_MEANING, hint))
+        n_pool = round(query_size * n_sequences)
+    else:
+        raise ValueError(
+            '{0}: query_size must be a float, an int, or None, got {1!r} of '
+            'type {2}. {3}'.format(
+                index, query_size, type(query_size).__name__,
+                _QUERY_SIZE_MEANING))
+    if n_pool < iterations:
+        # No point suggesting a bigger query_size once the pool is the whole
+        # database: the database itself is the limit.
+        fix = ('Reduce iterations to {0} or fewer.'.format(n_sequences)
+               if n_pool >= n_sequences
+               else 'Increase query_size or reduce iterations.')
+        raise ValueError(
+            '{0}: query_size={1} resolves to a total query pool of {2} '
+            'sequence(s) out of {3}, which cannot be divided between '
+            '{4} iterations (at least 1 sequence per fold is required). '
+            '{5} {6}'.format(
+                index, query_size, n_pool, n_sequences, iterations,
+                fix, _QUERY_SIZE_MEANING))
+    return n_pool
+
+
 def _replace_symlink(link_path, target_path):
     '''Create or replace *link_path* with a symlink to *target_path* (absolute).'''
     target_abs = abspath(target_path)
@@ -836,20 +930,57 @@ def _replace_symlink(link_path, target_path):
 
 
 def generate_cross_validated_trad_sequences(read_taxa, simulated_reads_fp, index,
-                                            iterations, cv_dir, force=False):
+                                            iterations, cv_dir, force=False,
+                                            query_size=None):
     '''Cross-validation folds by random split of sequence IDs (traditional CV).
 
-    For each fold, test sequences are drawn at random (``KFold`` with shuffling).
-    Query FASTA and query taxonomy hold only the test fold. The reference FASTA
-    and taxonomy are symbolic links to the full simulated-reads FASTA and cleaned
-    taxonomy TSV so the training database still contains every sequence (including
-    queries). Query taxonomy lines use the full expected string from the
-    database — no trimming to match the training taxonomies and no check that
-    test taxa appear in the reference.
+    For each fold, test sequences are drawn at random. Query FASTA and query
+    taxonomy hold only the test fold. The reference FASTA and taxonomy are
+    symbolic links to the full simulated-reads FASTA and cleaned taxonomy TSV,
+    so **the reference is the entire database in every fold, queries
+    included** — each query sequence has an exact self-match in the reference
+    it is classified against. Query taxonomy lines use the full expected
+    string from the database — no trimming to match the training taxonomies
+    and no check that test taxa appear in the reference.
 
     ``ref_seqs.qza`` and ``ref_taxa.qza`` are also symlinked to shared artifacts
     under the reference database directory (created once per database) to avoid
     duplicating QIIME artifacts across folds.
+
+    Parameters
+    ----------
+    query_size : float, int, or None, optional
+        Size of the **total query pool**, which is then divided evenly between
+        the ``iterations`` folds. A **float** in ``(0, 1]`` is a **fraction**
+        of the database; an **int** is an **absolute number of sequences**.
+        Both describe the total across all folds, not the size of one fold.
+
+        For example ``query_size=0.2`` with ``iterations=8`` queries 20% of
+        the database in total, so each fold holds 20%/8 = 2.5% of it.
+        Likewise ``query_size=8000`` with ``iterations=8`` gives 8 folds of
+        1000 sequences each.
+
+        ``None`` (default) uses the whole database as the pool, which is
+        equivalent to ``query_size=1.0``: each fold holds
+        ``n_sequences / iterations`` sequences.
+
+        An **int larger than this database** is not an error: a warning is
+        printed and the entire database is used as the pool. This lets one
+        int be shared across databases of different sizes, equalizing query
+        counts wherever the database is big enough to supply them.
+
+        In every case a random pool of the requested size is drawn (with a
+        fixed seed), then split with
+        ``KFold(n_splits=iterations, shuffle=True)``, so folds are disjoint
+        and together cover the pool exactly once. Folds differ by at most one
+        sequence when the pool does not divide evenly.
+
+    Notes
+    -----
+    Fold directories that already exist are rewritten in place, but nothing
+    keys off *query_size*, so changing it does not invalidate folds left over
+    from an earlier run with a different size. Pass ``force=True`` (Tourmaline:
+    ``force_regenerate: true``) when changing it.
     '''
     if iterations < 2:
         raise ValueError('Must perform two or more iterations for '
@@ -870,15 +1001,33 @@ def generate_cross_validated_trad_sequences(read_taxa, simulated_reads_fp, index
         view_type='HeaderlessTSVTaxonomyFormat')
     taxonomy_series = taxonomy.view(pd.Series)
 
-    kf = KFold(n_splits=iterations, shuffle=True, random_state=0)
-    print(index + ': generating', iterations, 'random KFold splits on',
-          len(seq_ids), 'sequences')
+    # The query pool is what gets divided between the folds. By default it is
+    # the whole database; query_size shrinks it to a random subset first.
+    if query_size is None:
+        pool_ids = seq_ids
+        print('{0}: dividing all {1} sequences between {2} folds '
+              '(~{3} query sequences per fold)'.format(
+                  index, len(seq_ids), iterations, len(seq_ids) // iterations))
+    else:
+        n_pool = _resolve_query_pool_size(
+            query_size, len(seq_ids), iterations, index)
+        # Fixed seed so the pool is reproducible across runs.
+        pool_idx = random.RandomState(0).permutation(len(seq_ids))[:n_pool]
+        pool_ids = [seq_ids[i] for i in sorted(pool_idx)]
+        print('{0}: query_size={1!r} -> dividing a random pool of {2} of {3} '
+              'sequences ({4:.2%} of the database) between {5} folds '
+              '(~{6} query sequences per fold, ~{7:.2%} of the database '
+              'each)'.format(
+                  index, query_size, n_pool, len(seq_ids),
+                  n_pool / len(seq_ids), iterations, n_pool // iterations,
+                  (n_pool / iterations) / len(seq_ids)))
 
     ref_reads_abs = abspath(simulated_reads_fp)
     ref_taxa_abs = abspath(read_taxa)
 
-    for iteration, (_train_idx, test_idx) in enumerate(kf.split(seq_ids)):
-        test = {seq_ids[i] for i in test_idx}
+    splitter = KFold(n_splits=iterations, shuffle=True, random_state=0)
+    for iteration, (_train_idx, test_idx) in enumerate(splitter.split(pool_ids)):
+        test = {pool_ids[i] for i in test_idx}
         db_iter_dir = join(cv_dir, format_cv_fold_dirname(index, iteration))
         if not exists(db_iter_dir):
             makedirs(db_iter_dir)

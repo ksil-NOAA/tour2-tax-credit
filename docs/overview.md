@@ -18,7 +18,17 @@ Simulations split a reference database into **query** (test) and **reference** (
 
 - **`cross-validated-taxa`** (maps to on-disk `cross-validated/`): stratified folds by taxonomic strata; query labels may be trimmed so each expected taxonomy prefix appears somewhere in the training taxonomies. Queries are **not** present in the per-fold reference FASTA / taxonomy tables.
 
-- **`cross-validated-trad`** (`cross-validated-trad/`): random **KFold** splits by sequence ID; query FASTA and `query_taxa.tsv` contain only the test fold. **`ref_seqs.fasta`** and **`ref_taxa.tsv`** are **symbolic links** to the full simulated-reads FASTA and cleaned taxonomy for that database, so the classifier sees **every** sequence (including queries). Evaluation still compares assignments to the held-out query labels. Shared **`ref_seqs.qza`** / **`ref_taxa.qza`** artifacts under `ref_dbs/` reduce duplication across folds (see [directory-layout.md](directory-layout.md)).
+- **`cross-validated-trad`** (`cross-validated-trad/`): random splits by sequence ID. Query FASTA and `query_taxa.tsv` contain only the test fold, but **`ref_seqs.fasta`** and **`ref_taxa.tsv`** are **symbolic links** to the full simulated-reads FASTA and cleaned taxonomy for that database.
+
+  **Only the query list is held out — the reference is not.** Every fold is classified against the entire database, queries included, so each query sequence has an exact self-match in the reference it is searched against. Query taxonomies are also left untrimmed, with no check that test taxa appear in the reference. Evaluation compares assignments to the query labels as usual.
+
+  Read this mode as a **ceiling on a random subset**, closer to `self-validated` than to a held-out cross-validation: scores are optimistically biased, and since a single classifier is fitted per database and reused for every fold, fold-to-fold spread understates real variance. Use `cross-validated-taxa` when you want queries genuinely absent from the fold's reference.
+
+  **`query_size`** (Tourmaline: `trad_cv_query_size`) sets the size of the **total query pool**, which is then divided evenly between the `iterations` folds. A float in `(0, 1]` is a fraction of the database; an int is an absolute number of sequences. Both describe the total across all folds, not the size of one fold — with `query_size=0.2` and `iterations=8`, 20% of the database is queried in total and each fold holds 20%/8 = 2.5% of it. Left unset, the pool is the whole database (equivalent to `query_size=1.0`), giving the historical `n_sequences / iterations` per fold. An int larger than a given database warns and falls back to that whole database, so a single int can be shared across databases of different sizes.
+
+  A random pool of the requested size is drawn with a fixed seed, then split with `KFold(n_splits=iterations, shuffle=True)`, so folds are always disjoint and together cover the pool exactly once; they differ by at most one sequence when the pool does not divide evenly. Changing `query_size` does not invalidate fold directories from an earlier run; pass `force=True` (`force_regenerate: true`) to rebuild them.
+
+  Shared **`ref_seqs.qza`** / **`ref_taxa.qza`** artifacts under `ref_dbs/` reduce duplication across folds (see [directory-layout.md](directory-layout.md)).
 
 The legacy alias **`cross-validated`** means **`cross-validated-taxa`**.
 

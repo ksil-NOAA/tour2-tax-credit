@@ -13,6 +13,8 @@ from os.path import exists, islink, join, realpath
 from collections import Counter
 from glob import glob
 from shutil import copy, rmtree
+from contextlib import redirect_stdout
+from io import StringIO
 
 from unittest import TestCase, main
 import pandas as pd
@@ -326,6 +328,184 @@ class EvalFrameworkTests(TestCase):
             self.assertFalse(exists(cross_validated_root(tmp)))
         finally:
             rmtree(tmp)
+
+    def _trad_ref_data(self, tmp):
+        '''Build the single-database frame used by the trad-CV tests.'''
+        copy(join(self.tmpdir, 'ref1.txt'), join(tmp, 'ref1.txt'))
+        qdir = join(tmp, 'B1-REF-L6-iter0')
+        makedirs(qdir)
+        copy(self.query_fp, join(qdir, QUERY_TAXA_TSV))
+        ref_data = pd.DataFrame.from_dict(
+            {'B1-REF': [
+                join(tmp, 'ref1.txt'),
+                join(qdir, QUERY_TAXA_TSV),
+                'ref1',
+                'GTGCCAGCMGCCGCGGTAA',
+                'GGACTACHVGGGTWTCTAAT',
+                '515f',
+                '806r',
+            ]},
+            orient='index')
+        ref_data.columns = [
+            'Reference file path',
+            'Reference tax path',
+            'Reference id',
+            'Fwd primer',
+            'Rev primer',
+            'Fwd primer id',
+            'Rev primer id',
+        ]
+        return ref_data
+
+    def _run_trad(self, tmp, iterations=2, query_size=None):
+        '''Generate trad-CV folds; return (query id sets, n simulated reads).'''
+        generate_simulated_datasets(
+            self._trad_ref_data(tmp), tmp, iterations, read_length=100,
+            levelrange=range(6, 5, -1), trim_primers=False,
+            simulation_method='cross-validated-trad',
+            trad_cv_query_size=query_size)
+        trad = cross_validated_trad_root(tmp)
+        fold_queries = [
+            set(import_to_list(
+                join(trad, 'B1-REF-iter{0}'.format(i), QUERY_TAXA_TSV),
+                field=0))
+            for i in range(iterations)]
+        n_reads = seq_count(simulated_reads_filepath(
+            join(ref_dbs_root(tmp), 'ref1', 'ref1_clean.fasta'),
+            '515f', '806r', trim_primers=False))
+        return fold_queries, n_reads
+
+    def test_trad_query_size_default_pools_whole_database(self):
+        """query_size=None divides the whole database between the folds."""
+        tmp = mkdtemp()
+        try:
+            folds, n_reads = self._run_trad(tmp, iterations=2)
+            # Folds partition the database: disjoint and covering it exactly.
+            self.assertEqual(folds[0] & folds[1], set())
+            self.assertEqual(len(folds[0]) + len(folds[1]), n_reads)
+            for fold in folds:
+                self.assertEqual(len(fold), n_reads // 2)
+        finally:
+            rmtree(tmp)
+
+    def test_trad_query_size_float_is_fraction_of_total_pool(self):
+        """A float is the TOTAL fraction queried, split between the folds."""
+        tmp = mkdtemp()
+        try:
+            folds, n_reads = self._run_trad(tmp, iterations=2, query_size=0.5)
+            pool = folds[0] | folds[1]
+            # Half the database in total...
+            self.assertEqual(len(pool), round(0.5 * n_reads))
+            # ...divided between the two folds, so a quarter each.
+            self.assertEqual(folds[0] & folds[1], set())
+            for fold in folds:
+                self.assertEqual(len(fold), round(0.5 * n_reads) // 2)
+        finally:
+            rmtree(tmp)
+
+    def test_trad_query_size_int_is_absolute_total_count(self):
+        """An int is the TOTAL number of sequences, not a per-fold count."""
+        tmp = mkdtemp()
+        try:
+            total = 4
+            folds, n_reads = self._run_trad(
+                tmp, iterations=2, query_size=total)
+            pool = folds[0] | folds[1]
+            self.assertEqual(len(pool), total)
+            self.assertEqual(folds[0] & folds[1], set())
+            for fold in folds:
+                self.assertEqual(len(fold), total // 2)
+            # Smaller than the whole database, which the default would use.
+            self.assertLess(len(pool), n_reads)
+        finally:
+            rmtree(tmp)
+
+    def test_trad_query_size_one_point_zero_matches_default(self):
+        """query_size=1.0 means the whole database, i.e. the default."""
+        tmp_default = mkdtemp()
+        tmp_explicit = mkdtemp()
+        try:
+            default, _ = self._run_trad(tmp_default, iterations=2)
+            explicit, _ = self._run_trad(
+                tmp_explicit, iterations=2, query_size=1.0)
+            self.assertEqual(default, explicit)
+        finally:
+            rmtree(tmp_default)
+            rmtree(tmp_explicit)
+
+    def test_trad_query_size_keeps_full_reference(self):
+        """The reference stays the whole database regardless of query_size."""
+        tmp = mkdtemp()
+        try:
+            self._run_trad(tmp, iterations=2, query_size=4)
+            trad = cross_validated_trad_root(tmp)
+            clean_taxa_path = join(
+                ref_dbs_root(tmp), 'ref1', 'query_taxa_clean.tsv')
+            sim_reads = simulated_reads_filepath(
+                join(ref_dbs_root(tmp), 'ref1', 'ref1_clean.fasta'),
+                '515f', '806r', trim_primers=False)
+            for i in range(2):
+                fold = join(trad, 'B1-REF-iter{0}'.format(i))
+                self.assertEqual(
+                    realpath(join(fold, REF_SEQS_FASTA)), realpath(sim_reads))
+                self.assertEqual(
+                    realpath(join(fold, REF_TAXA_TSV)),
+                    realpath(clean_taxa_path))
+                # queries are present in the reference they are classified against
+                qids = set(import_to_list(join(fold, QUERY_TAXA_TSV), field=0))
+                rids = set(import_to_list(join(fold, REF_TAXA_TSV), field=0))
+                self.assertTrue(qids.issubset(rids))
+        finally:
+            rmtree(tmp)
+
+    def test_trad_query_size_larger_than_database_uses_whole_database(self):
+        """An int bigger than the database warns and falls back to all of it."""
+        tmp = mkdtemp()
+        try:
+            buf = StringIO()
+            with redirect_stdout(buf):
+                folds, n_reads = self._run_trad(
+                    tmp, iterations=2, query_size=9999)
+            output = buf.getvalue()
+            # warned, naming the oversized request and the real database size
+            self.assertIn('WARNING', output)
+            self.assertIn('9999', output)
+            self.assertIn(str(n_reads), output)
+            # and fell back to the whole database, as query_size=None would
+            pool = folds[0] | folds[1]
+            self.assertEqual(len(pool), n_reads)
+            self.assertEqual(folds[0] & folds[1], set())
+            default, _ = self._run_trad(mkdtemp(), iterations=2)
+            self.assertEqual(folds, default)
+        finally:
+            rmtree(tmp)
+
+    def test_trad_query_size_rejects_invalid_values(self):
+        """Bad query_size values raise, naming both the float and int reading."""
+        cases = [
+            (1.5, 'at most 1'),            # float may not exceed the database
+            (0.0, 'greater than 0'),
+            (-0.5, 'greater than 0'),
+            (0, 'at least 1'),             # int must be >= 1
+            ('0.1', 'must be a float, an int, or None'),
+            (True, 'must be a float or an int'),
+            # a pool too small to give every fold at least one sequence
+            (1, 'cannot be divided between'),
+            (0.05, 'cannot be divided between'),
+        ]
+        for bad, expected in cases:
+            tmp = mkdtemp()
+            try:
+                with self.assertRaises(ValueError) as ctx:
+                    self._run_trad(tmp, iterations=2, query_size=bad)
+                message = str(ctx.exception)
+                self.assertIn(expected, message)
+                # every message spells out both readings
+                self.assertIn('FRACTION', message)
+                self.assertIn('ABSOLUTE NUMBER', message)
+                self.assertIn('TOTAL pool', message)
+            finally:
+                rmtree(tmp)
 
     def test_generate_simulated_datasets_novel_taxa_only(self):
         tmp = mkdtemp()

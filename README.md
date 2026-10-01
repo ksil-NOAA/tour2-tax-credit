@@ -13,7 +13,7 @@ Tourmaline's `scripts/run_tax_credit.py` imports it and runs the whole benchmark
 ## How it differs from the original tax-credit
 
 - **Trimmed to what Tourmaline uses.** The legacy notebook-only modules (`eval_framework`, `mock_evaluation`, `biom_cache`, `process_mocks`, `mock_denoise`, `mock_transport`, `mock_quality`, `mockrobiota_extract`, `simulated_communities`) have been removed. See [Package layout](#package-layout) for what remains.
-- **New evaluation modes.** Traditional random K-fold cross-validation (`cross-validated-trad`) and running a full database against itself (`self-validated`) have been added alongside the original taxonomy-stratified folds, with shared reference artifacts to avoid duplicating a database per fold.
+- **New evaluation modes.** Random-split cross-validation (`cross-validated-trad`, with a configurable query-set size) and running a full database against itself (`self-validated`) have been added alongside the original taxonomy-stratified folds, with shared reference artifacts to avoid duplicating a database per fold.
 - **New mock-community implementation.** `tax_credit.mock_community` replaces the old `mock_evaluation` / `eval_framework` scoring path, and works from feature tables, ASV sequences and expected composition or per-ASV "trueish" taxonomies.
 - **Log analysis and plot theming.** `tax_credit.log_analysis`, `tax_credit.log_plotting` and `tax_credit.plot_theme` were added to summarize per-taxon classifier behaviour and to give the generated figures a consistent look.
 - **Modernized environment.** Targets QIIME 2 amplicon 2024.10 (Python 3.10). 
@@ -41,12 +41,20 @@ Five evaluation modes are supported. The first four are simulated from the refer
 | Mode | What it does |
 |---|---|
 | `cross-validated` | Taxonomy-aware K-fold splits; classify held-out sequences. |
-| `cross-validated-trad` | Traditional random K-fold splits. |
+| `cross-validated-trad` | Random splits of the query list; the reference keeps every sequence (see caveat below). |
 | `novel-taxa` | Hold out whole taxa, so a query's own taxon is absent from the reference. |
 | `self-validated` | Classify the full database against itself; a best-case ceiling. |
 | `mock-community` | Classify real reads from communities of known composition. |
 
 Benchmark runs are large — a full matrix of databases × methods × parameter sets × folds is hundreds of assignment jobs. Start with a reduced matrix.
+
+### A caveat on `cross-validated-trad`
+
+This mode holds out the query *list* but **not the reference**. Each fold's `ref_seqs.fasta` and `ref_taxa.tsv` are symlinks to the full database, so every query is classified against a reference that still contains it — an exact self-match. A single classifier is also fitted per database and reused across all folds.
+
+Read its scores as a **ceiling measured on a random subset** rather than as cross-validated performance: they are optimistically biased, and fold-to-fold spread understates real variance. Use `cross-validated` (taxonomy-aware) when you want queries genuinely absent from the fold's reference.
+
+By default the whole database is divided between the folds, so each queries `n_sequences / iterations` sequences. Tourmaline's `trad_cv_query_size` shrinks the **total** query pool instead, which is then divided the same way — a **float** in (0, 1] is a **fraction** of the database, an **int** is an **absolute count**, and both describe the total across all folds rather than one fold. With `trad_cv_query_size: 0.2` and `iterations: 8`, 20% of the database is queried in total and each fold holds 2.5% of it. An int larger than a given database warns and uses that whole database instead, so one int can be shared across databases of different sizes. Folds stay disjoint either way. Changing it on a run whose folds already exist requires `force_regenerate: true`, or the old folds are reused at their previous size.
 
 ## Package layout
 

@@ -123,11 +123,31 @@ For **cross-validated-trad**, builds two shell-command lists: **fit** naive Baye
 
 `generate_simulated_datasets(..., simulation_method=...)` accepts a single value or any combination of:
 - `cross-validated-taxa` (original taxonomy-aware CV output under `cross-validated/`)
-- `cross-validated-trad` (random KFold CV under `cross-validated-trad/`; each fold keeps only test sequences in `query.fasta` / `query_taxa.tsv`, while `ref_seqs.fasta` and `ref_taxa.tsv` are **symlinks** to the full simulated-reads FASTA and cleaned taxonomy TSV so the reference still includes every sequence. Per-fold `ref_seqs.qza` and `ref_taxa.qza` symlink to shared QIIME artifacts in the ref database directory (`_trad_cv_shared_ref_seqs.qza` and `_trad_cv_shared_ref_taxa.qza`) to save disk space.)
+- `cross-validated-trad` (random CV under `cross-validated-trad/`; each fold keeps only test sequences in `query.fasta` / `query_taxa.tsv`, while `ref_seqs.fasta` and `ref_taxa.tsv` are **symlinks** to the full simulated-reads FASTA and cleaned taxonomy TSV, so **the reference is the whole database in every fold, queries included**. Per-fold `ref_seqs.qza` and `ref_taxa.qza` symlink to shared QIIME artifacts in the ref database directory (`_trad_cv_shared_ref_seqs.qza` and `_trad_cv_shared_ref_taxa.qza`) to save disk space.)
 - `novel-taxa` (novel-taxa output under `novel-taxa-simulations/`)
 
 Default behavior generates **all three** simulation types.  
 Backward compatibility: `cross-validated` is treated as an alias of `cross-validated-taxa`.
+
+### `trad_cv_query_size` (cross-validated-trad query pool)
+
+`generate_simulated_datasets(..., trad_cv_query_size=None)` forwards to `generate_cross_validated_trad_sequences(..., query_size=...)`. It sizes the **total query pool**, which is then divided evenly between the `iterations` folds — it is *not* the size of one fold. Other simulation methods ignore it.
+
+| Value | Total pool | Per fold (with `iterations=8`) |
+|---|---|---|
+| `None` (default) | The whole database. | `n_sequences / 8`, i.e. 12.5% of the database. |
+| float in `(0, 1]` | That **fraction** of the database — `0.2` is 20% of sequences. | 20%/8 = **2.5%** of the database. |
+| int | That **absolute number** of sequences — `8000` is 8000 sequences. | 8000/8 = **1000** sequences. |
+
+`1.0` is accepted and means the whole database, so it behaves exactly like the default.
+
+An **int larger than a given database** is not an error: a `WARNING:` is printed and that whole database is used as the pool. This is what makes one int usable across databases of different sizes — every database big enough supplies the same query count, and smaller ones contribute everything they have (the warning says so, since their query counts will not match).
+
+In every case a random pool of the requested size is drawn with a fixed seed, then split with `KFold(n_splits=iterations, shuffle=True, random_state=0)`. Folds are therefore always **disjoint** and together cover the pool exactly once, differing by at most one sequence when the pool does not divide evenly.
+
+`ValueError` is raised, with a message naming both the float and int readings, for: a float at or below 0 or above 1; an int below 1; a non-numeric type; and any value whose resolved pool would be smaller than `iterations` (some fold would get no sequences) — including a database with fewer sequences than `iterations`.
+
+Fold directories left over from an earlier run are not invalidated by a change to `query_size`; pass `force=True` (Tourmaline: `force_regenerate: true`) to rebuild them at the new size.
 
 ---
 
