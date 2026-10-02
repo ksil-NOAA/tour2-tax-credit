@@ -758,6 +758,15 @@ def generate_cross_validated_sequences(read_taxa, simulated_reads_fp, index,
     duplicated taxa names, evenly allocates these among subsets as query taxa
     (test set), generates ref taxa (training set) that do not match query fasta
     IDs, and creates fasta files to match each of these sets.
+
+    Each query's expected taxonomy is truncated to its deepest prefix that the
+    fold's training set still contains. A query with **no** prefix in training --
+    not even its first rank -- is dropped from the fold, and the per-fold counts
+    are printed. That happens when every sequence sharing a first rank lands in
+    the same test fold, which is guaranteed when only one sequence holds it (the
+    split runs on reads surviving amplicon extraction, so a clade can be
+    plentiful in the database and a singleton here). Dropped queries are left
+    out of ``query.fasta`` as well, keeping it aligned with ``query_taxa.tsv``.
     read_taxa: list or path
         list or file of taxonomies corresponding to simulated_reads_fp
     simulated_reads_fp: path
@@ -814,23 +823,60 @@ def generate_cross_validated_sequences(read_taxa, simulated_reads_fp, index,
             for level in range(1, len(taxonomy)+1):
                 train_taxonomies.add(';'.join(taxonomy[:level]))
         test_list = []
+        n_trimmed = 0
+        dropped = []
         for sid in test:
             taxonomy = taxonomy_series[sid].split(';')
             for level in range(len(taxonomy), 0, -1):
                 if ';'.join(taxonomy[:level]) in train_taxonomies:
+                    if level < len(taxonomy):
+                        n_trimmed += 1
                     test_list.append(
                         '\t'.join([sid, ';'.join(taxonomy[:level]).strip()]))
                     break
             else:
-                raise RuntimeError('unknown kingdom in query set')
+                # Not even the first rank survives in this fold's training set.
+                # That happens when every sequence sharing a first rank landed
+                # in this test fold -- guaranteed when only one sequence holds
+                # it. No classifier can return a rank the reference does not
+                # contain, so grading against it would score every method as
+                # wrong whatever it did. Drop the query from the fold, the same
+                # way generate_novel_sequence_sets does.
+                dropped.append(sid)
+        if n_trimmed or dropped:
+            message = (
+                '{0}: expected taxonomy truncated to the training set for {1} '
+                'of {2} queries'.format(
+                    format_cv_fold_dirname(index, iteration), n_trimmed,
+                    len(test)))
+            if dropped:
+                missing = sorted({
+                    taxonomy_series[s].split(';')[0] for s in dropped})
+                message += (
+                    '; {0} dropped (first rank absent from the training set: '
+                    '{1}{2})'.format(
+                        len(dropped), ', '.join(repr(m) for m in missing[:5]),
+                        ', ...' if len(missing) > 5 else ''))
+            print(message)
+        if not test_list:
+            raise RuntimeError(
+                '{0}: every query was dropped, leaving an empty fold. The '
+                'reference database has too little overlap between folds to '
+                'cross-validate; reduce iterations or clean the '
+                'taxonomy.'.format(format_cv_fold_dirname(index, iteration)))
         export_list_to_file(test_list, query_taxa_fp)
-        # Output the reference files
+        # Output the reference files. Dropped queries are left out of
+        # query.fasta as well, so it stays aligned with query_taxa.tsv -- a
+        # sequence with no expected taxonomy would otherwise be classified and
+        # then have nothing to score against.
+        dropped_ids = set(dropped)
         with open(ref_fp, 'w') as ref_fasta:
             with open(query_fp, 'w') as query_fasta:
                 for seq in simulated_reads:
-                    if seq.metadata['id'] in train:
+                    sid = seq.metadata['id']
+                    if sid in train:
                         seq.write(ref_fasta, format='fasta')
-                    else:
+                    elif sid not in dropped_ids:
                         seq.write(query_fasta, format='fasta')
 
         # Encode as Artifacts for convenience
@@ -942,6 +988,11 @@ def generate_cross_validated_trad_sequences(read_taxa, simulated_reads_fp, index
     it is classified against. Query taxonomy lines use the full expected
     string from the database — no trimming to match the training taxonomies
     and no check that test taxa appear in the reference.
+
+    Because the reference is the whole database, every query's full lineage is
+    present in it by construction. So unlike the taxonomy-aware builder, this
+    one never truncates or drops a query: there is no equivalent here of a
+    first rank going missing from the training set.
 
     ``ref_seqs.qza`` and ``ref_taxa.qza`` are also symlinked to shared artifacts
     under the reference database directory (created once per database) to avoid

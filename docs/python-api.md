@@ -129,6 +129,16 @@ For **cross-validated-trad**, builds two shell-command lists: **fit** naive Baye
 Default behavior generates **all three** simulation types.  
 Backward compatibility: `cross-validated` is treated as an alias of `cross-validated-taxa`.
 
+### Dropped queries in `cross-validated-taxa`
+
+`generate_cross_validated_sequences` truncates each query's expected taxonomy to the deepest prefix the fold's training set still holds. A query with no prefix in training at all is **dropped from the fold** (it used to raise `RuntimeError('unknown kingdom in query set')` and abort the run), and the counts are printed per fold:
+
+```
+<db>-iter3: expected taxonomy truncated to the training set for 113 of 200 queries; 1 dropped (first rank absent from the training set: 'k__Archaea')
+```
+
+A fold left with no queries at all still raises, since it cannot be evaluated. `cross-validated-trad` and `self-validated` never drop anything: their reference is the whole database, so every query's full lineage is present by construction.
+
 ### `trad_cv_query_size` (cross-validated-trad query pool)
 
 `generate_simulated_datasets(..., trad_cv_query_size=None)` forwards to `generate_cross_validated_trad_sequences(..., query_size=...)`. It sizes the **total query pool**, which is then divided evenly between the `iterations` folds — it is *not* the size of one fold. Other simulation methods ignore it.

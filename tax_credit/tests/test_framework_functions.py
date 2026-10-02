@@ -30,6 +30,7 @@ from tax_credit.framework_functions import (
     simulated_reads_filepath,
 )
 from tax_credit.paths import (
+    QUERY_FASTA,
     QUERY_TAXA_TSV,
     QUERY_TAX_ASSIGNMENTS_TXT,
     REF_SEQS_FASTA,
@@ -326,6 +327,115 @@ class EvalFrameworkTests(TestCase):
                 self.assertTrue(qids.issubset(rids))
             self.assertFalse(exists(novel_taxa_simulations_root(tmp)))
             self.assertFalse(exists(cross_validated_root(tmp)))
+        finally:
+            rmtree(tmp)
+
+    def _singleton_first_rank_ref_data(self, tmp):
+        '''Frame whose taxonomy has one sequence as the sole holder of its
+        first rank, so whichever fold tests it has none of that rank in
+        training.'''
+        copy(join(self.tmpdir, 'ref1.txt'), join(tmp, 'ref1.txt'))
+        lines = [
+            line for line in
+            open(self.query_fp, encoding='utf-8').read().split('\n') if line
+        ]
+        sid, taxon = lines[0].split('\t')
+        lines[0] = '\t'.join(
+            [sid, taxon.replace('k__Bacteria', 'k__Archaea', 1)])
+        taxa_fp = join(tmp, 'taxa_singleton.tsv')
+        with open(taxa_fp, 'w', encoding='utf-8') as out:
+            out.write('\n'.join(lines))
+        ref_data = pd.DataFrame.from_dict(
+            {'B1-REF': [
+                join(tmp, 'ref1.txt'), taxa_fp, 'ref1',
+                'GTGCCAGCMGCCGCGGTAA', 'GGACTACHVGGGTWTCTAAT', '515f', '806r',
+            ]},
+            orient='index')
+        ref_data.columns = [
+            'Reference file path', 'Reference tax path', 'Reference id',
+            'Fwd primer', 'Rev primer', 'Fwd primer id', 'Rev primer id',
+        ]
+        return ref_data, sid
+
+    def test_cv_drops_query_whose_first_rank_is_absent_from_training(self):
+        '''A singleton first rank is dropped from the fold, not fatal.
+
+        Previously this raised RuntimeError('unknown kingdom in query set') and
+        killed the whole run over one sequence.
+        '''
+        tmp = mkdtemp()
+        try:
+            ref_data, orphan_sid = self._singleton_first_rank_ref_data(tmp)
+            buf = StringIO()
+            with redirect_stdout(buf):
+                generate_simulated_datasets(
+                    ref_data, tmp, 2, read_length=100,
+                    levelrange=range(6, 5, -1), trim_primers=False,
+                    simulation_method='cross-validated-taxa')
+            output = buf.getvalue()
+            cvdir = cross_validated_root(tmp)
+
+            folds = [join(cvdir, 'B1-REF-iter{0}'.format(i)) for i in range(2)]
+            for fold in folds:
+                self.assertTrue(exists(join(fold, QUERY_TAXA_TSV)))
+
+            # The orphan is a query in exactly one fold, and that fold must have
+            # dropped it from BOTH the expected taxonomy and the query FASTA --
+            # a sequence with no expected taxonomy would be classified and then
+            # have nothing to score against.
+            dropped_somewhere = False
+            for fold in folds:
+                q_ids = set(import_to_list(
+                    join(fold, QUERY_TAXA_TSV), field=0))
+                ref_ids = set(import_to_list(join(fold, REF_TAXA_TSV), field=0))
+                fasta_ids = {
+                    line[1:].split()[0]
+                    for line in open(join(fold, QUERY_FASTA),
+                                     encoding='utf-8')
+                    if line.startswith('>')
+                }
+                # query_taxa.tsv and query.fasta must always agree
+                self.assertEqual(q_ids, fasta_ids)
+                if orphan_sid not in ref_ids and orphan_sid not in q_ids:
+                    dropped_somewhere = True
+            self.assertTrue(
+                dropped_somewhere,
+                'the singleton-first-rank query was never dropped, so this '
+                'fixture no longer reproduces the condition')
+            self.assertIn('dropped', output)
+            self.assertIn('k__Archaea', output)
+        finally:
+            rmtree(tmp)
+
+    def test_trad_cv_never_drops_queries(self):
+        '''cross-validated-trad keeps every query: its reference is the full DB.
+
+        The taxonomy-aware builder has to truncate and sometimes drop queries;
+        trad cannot, because every query's lineage is in the reference by
+        construction. Same fixture that forces a drop above.
+        '''
+        tmp = mkdtemp()
+        try:
+            ref_data, orphan_sid = self._singleton_first_rank_ref_data(tmp)
+            buf = StringIO()
+            with redirect_stdout(buf):
+                generate_simulated_datasets(
+                    ref_data, tmp, 2, read_length=100,
+                    levelrange=range(6, 5, -1), trim_primers=False,
+                    simulation_method='cross-validated-trad')
+            self.assertNotIn('dropped', buf.getvalue())
+
+            trad = cross_validated_trad_root(tmp)
+            all_queries = set()
+            for i in range(2):
+                fold = join(trad, 'B1-REF-iter{0}'.format(i))
+                q = import_taxonomy_to_dict(join(fold, QUERY_TAXA_TSV))
+                ref_ids = set(import_to_list(join(fold, REF_TAXA_TSV), field=0))
+                # every query is in its own reference, untrimmed
+                self.assertTrue(set(q).issubset(ref_ids))
+                all_queries.update(q)
+            # including the sequence the taxonomy-aware builder had to drop
+            self.assertIn(orphan_sid, all_queries)
         finally:
             rmtree(tmp)
 
