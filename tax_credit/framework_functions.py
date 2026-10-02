@@ -15,6 +15,7 @@ from os.path import (
     exists,
     expandvars,
     basename,
+    isfile,
     join,
     lexists,
     split,
@@ -530,8 +531,11 @@ def generate_simulated_datasets(dataframe, data_dir, iterations,
 
         # Generate novel query and reference seqs/taxa pairs
         if make_novel:
+            # Scope to this database: the loop calls this once per database, so
+            # an unscoped glob would rebuild the earlier databases' novel folds
+            # again and would read any half-written fold left in cv_taxa_dir.
             generate_novel_sequence_sets(
-                cv_taxa_dir, novel_dir, levelrange=levelrange)
+                cv_taxa_dir, novel_dir, levelrange=levelrange, index=index)
             # If cv-taxa output wasn't requested, discard temporary folds.
             if not make_cv_taxa:
                 for fold_dir in glob(
@@ -657,7 +661,7 @@ def generate_self_validated_datasets(dataframe, data_dir, read_length=None,
 
 
 def generate_novel_sequence_sets(cv_dir, novel_dir,
-                                 levelrange=range(6, 0, -1)):
+                                 levelrange=range(6, 0, -1), index=None):
     '''Generate paired query/reference fastas and taxonomies for novel taxa
     analysis, given an input of simulated amplicon taxonomies (read_taxa)
     and fastas (simulated_reads_fp), the index (database) name, # of
@@ -667,15 +671,32 @@ def generate_novel_sequence_sets(cv_dir, novel_dir,
         base output directory to contain simulated datasets
     cv_dir: path
         directory containing cross-validation data sets for filtering
+    index: str or None
+        Reference database name. Only that database's fold directories
+        (``<index>-iter*``) are read. ``None`` reads every fold in *cv_dir*,
+        which is only correct when it holds a single database: this function is
+        called once per database, so an unscoped glob reprocesses the earlier
+        databases' folds and, worse, trips over a half-written fold left in
+        ``cv_dir`` by a previous failed run (one with ``ref_taxa.tsv`` but no
+        ``query_taxa.tsv`` yet).
     '''
 
-    for cv_fold_dir in glob(join(cv_dir, '*')):
+    fold_pattern = '*' if index is None else format_cv_fold_dirname(index, '*')
+    for cv_fold_dir in sorted(glob(join(cv_dir, fold_pattern))):
+        query_taxa_in = join(cv_fold_dir, QUERY_TAXA_TSV)
+        if not isfile(query_taxa_in):
+            # A fold directory without its query taxonomy is left over from a
+            # run that died partway through writing it. Skipping is safe: this
+            # run rewrites the folds it owns before getting here.
+            print('WARNING: skipping {0}: no {1} (left over from an '
+                  'interrupted run?)'.format(cv_fold_dir, QUERY_TAXA_TSV))
+            continue
         cv_parts = parse_cv_dataset_id(basename(cv_fold_dir))
-        index, iteration = cv_parts.database, cv_parts.iteration
+        fold_db, iteration = cv_parts.database, cv_parts.iteration
         for level in levelrange:
             novel_fold_dir = join(
                 novel_dir,
-                format_novel_fold_dirname(index, level, int(iteration)))
+                format_novel_fold_dirname(fold_db, level, int(iteration)))
             if not exists(novel_fold_dir):
                 makedirs(novel_fold_dir)
 

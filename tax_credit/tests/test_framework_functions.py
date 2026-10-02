@@ -8,7 +8,7 @@
 # The full license is in the file COPYING.txt, distributed with this software.
 # ----------------------------------------------------------------------------
 
-from os import makedirs
+from os import makedirs, remove
 from os.path import exists, islink, join, realpath
 from collections import Counter
 from glob import glob
@@ -20,6 +20,7 @@ from unittest import TestCase, main
 import pandas as pd
 from tempfile import mkdtemp
 from tax_credit.framework_functions import (
+    generate_novel_sequence_sets,
     generate_simulated_datasets,
     clean_database,
     evaluate_classification,
@@ -436,6 +437,70 @@ class EvalFrameworkTests(TestCase):
                 all_queries.update(q)
             # including the sequence the taxonomy-aware builder had to drop
             self.assertIn(orphan_sid, all_queries)
+        finally:
+            rmtree(tmp)
+
+    def test_novel_taxa_ignores_stale_fold_from_another_database(self):
+        '''A half-written fold left by a failed run must not break this one.
+
+        generate_novel_sequence_sets runs once per database but used to glob
+        every fold in cross-validated/, so a directory holding ref_taxa.tsv but
+        not yet query_taxa.tsv -- exactly what an interrupted run leaves -- made
+        it die with "unknown file type in .../query_taxa.tsv".
+        '''
+        tmp = mkdtemp()
+        try:
+            # Leftover from a previous run on a DIFFERENT database: the fold dir
+            # and ref_taxa.tsv exist, query_taxa.tsv does not.
+            stale = join(cross_validated_root(tmp), 'otherdb-iter1')
+            makedirs(stale)
+            with open(join(stale, REF_TAXA_TSV), 'w') as out:
+                out.write('x\tk__Bacteria; p__Firmicutes\n')
+
+            buf = StringIO()
+            with redirect_stdout(buf):
+                generate_simulated_datasets(
+                    self.ref_data, tmp, 2, read_length=100,
+                    levelrange=range(6, 5, -1), trim_primers=False,
+                    simulation_method=['cross-validated-taxa', 'novel-taxa'])
+
+            # This database's novel folds were still built...
+            ntdir = novel_taxa_simulations_root(tmp)
+            for i in range(2):
+                self.assertTrue(exists(
+                    join(ntdir, 'B1-REF-L6-iter{0}'.format(i))))
+            # ...and nothing was built for the stale database.
+            self.assertEqual(glob(join(ntdir, 'otherdb*')), [])
+            # Scoping means the stale fold is never even looked at, so no
+            # warning is needed; the run simply succeeds.
+            self.assertTrue(exists(join(stale, REF_TAXA_TSV)))
+        finally:
+            rmtree(tmp)
+
+    def test_novel_taxa_skips_incomplete_fold_of_same_database(self):
+        '''An incomplete fold of the database being processed is skipped loudly.'''
+        tmp = mkdtemp()
+        try:
+            generate_simulated_datasets(
+                self.ref_data, tmp, 2, read_length=100,
+                levelrange=range(6, 5, -1), trim_primers=False,
+                simulation_method='cross-validated-taxa')
+            # Simulate an interrupted write: drop one fold's query taxonomy.
+            fold = join(cross_validated_root(tmp), 'B1-REF-iter1')
+            remove(join(fold, QUERY_TAXA_TSV))
+
+            buf = StringIO()
+            with redirect_stdout(buf):
+                generate_novel_sequence_sets(
+                    cross_validated_root(tmp),
+                    novel_taxa_simulations_root(tmp),
+                    levelrange=range(6, 5, -1), index='B1-REF')
+            output = buf.getvalue()
+            self.assertIn('skipping', output)
+            self.assertIn('B1-REF-iter1', output)
+            # the intact fold was still processed
+            self.assertTrue(exists(join(
+                novel_taxa_simulations_root(tmp), 'B1-REF-L6-iter0')))
         finally:
             rmtree(tmp)
 
