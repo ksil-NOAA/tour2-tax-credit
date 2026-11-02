@@ -48,6 +48,38 @@ class NovelEvaluationModuleTests(unittest.TestCase):
             _truncate_taxonomy_at_level("A;B;C;D;E;F;NA", 6), "A;B;C;D;E;F"
         )
 
+    def test_load_prf_projects_extra_ranks(self):
+        # PR2-style nine ranks, scored on seven by dropping ranks 1 and 3
+        positions = [0, 2, 4, 5, 6, 7, 8]
+        with TemporaryDirectory() as tmp:
+            exp_fp, obs_fp = join(tmp, "exp.tsv"), join(tmp, "obs.tsv")
+            with open(exp_fp, "w") as f:
+                f.write("s1\tD;SG;Div;Sub;C;O;F;G;S\n")
+                # expected truncated to family by the fold's reference
+                f.write("s2\tD;SG;Div;Sub;C;O;F\n")
+            with open(obs_fp, "w") as f:
+                f.write("Feature ID\tTaxon\tConfidence\n")
+                f.write("s1\tD;SG;Div;Sub\t0.9\n")
+                f.write("s2\tUnassigned\t0\n")
+            exp, obs = framework_functions.load_prf(
+                obs_fp, exp_fp, rank_positions=positions)
+            self.assertEqual(exp, ["D;Div;C;O;F;G;S", "D;Div;C;O;F"])
+            self.assertEqual(obs, ["D;Div", "Unassigned"])
+            # without positions the old behaviour holds: the first seven ranks
+            exp, _ = framework_functions.load_prf(obs_fp, exp_fp)
+            self.assertEqual(exp[0], "D;SG;Div;Sub;C;O;F")
+
+    def test_load_prf_rejects_taxonomy_deeper_than_declared(self):
+        with TemporaryDirectory() as tmp:
+            exp_fp, obs_fp = join(tmp, "exp.tsv"), join(tmp, "obs.tsv")
+            with open(exp_fp, "w") as f:
+                f.write("s1\tA;B;C;D;E;F;G;H;I\n")
+            with open(obs_fp, "w") as f:
+                f.write("s1\tA;B\n")
+            with self.assertRaises(ValueError):
+                framework_functions.load_prf(
+                    obs_fp, exp_fp, rank_positions=[0, 1, 2, 3, 4, 5, 6])
+
     def test_per_level_ratios_with_internal_na(self):
         # Wrong genus under an NA order: the error belongs at level 5 (genus).
         # Dropping the NA rank would shift it up to level 4 (family).
@@ -69,20 +101,70 @@ class NovelEvaluationModuleTests(unittest.TestCase):
         self.assertEqual(by_level[5]["misclassification_ratio"], 1.0)
         self.assertEqual(by_level[6]["misclassification_ratio"], 1.0)
 
-    def test_per_level_match_ratio_is_recall(self):
-        # Two matches: one full 7-rank taxon (mismatch level 7) and one against a
-        # genus-only reference (mismatch level 6). Summing mismatch_level_list
-        # would give 0.5 at species; recall is 1.0.
+    def test_extract_per_level_accuracy_parses_stringified_lists(self):
+        # a summary read back from CSV holds its per-level scores as reprs
         df = pd.DataFrame([{
             "Dataset": "db1", "level": 6, "iteration": "0",
             "Method": "m", "Parameters": "p",
             "mismatch_level_list": "[0, 0, 0, 0, 0, 0, 1, 1]",
-            "Precision": "[0, 1, 1, 1, 1, 1, 1]",
-            "Recall": "[0, 1, 1, 1, 1, 1, 1]",
-            "F-measure": "[0, 1, 1, 1, 1, 1, 1]",
+            "Precision": "[nan, 1, 1, 1, 1, 1, 0.5]",
+            "Recall": "[nan, 1, 1, 1, 1, 1, 0.8]",
+            "F-measure": "[nan, 1, 1, 1, 1, 1, 0.6]",
+            "Recall_original": "[nan, 1, 1, 1, 1, 1, 0.4]",
+            "F-measure_original": "[nan, 1, 1, 1, 1, 1, 0.3]",
         }])
         pla = novel_evaluation.extract_per_level_accuracy(df)
-        self.assertEqual(list(pla["match_ratio"]), [1.0] * 6)
+        self.assertEqual(list(pla["level"]), list(range(1, 7)))
+        self.assertEqual(pla.iloc[5]["Recall"], 0.8)
+        self.assertEqual(pla.iloc[5]["Recall_original"], 0.4)
+        self.assertEqual(pla.iloc[5]["F-measure_original"], 0.3)
+
+    def test_extract_per_level_accuracy_does_not_derive_match_ratio(self):
+        # match_ratio used to be taken from Recall, which was only valid while
+        # every non-match counted as a false negative
+        df = pd.DataFrame([{
+            "Dataset": "db1", "level": 6, "iteration": "0",
+            "Method": "m", "Parameters": "p",
+            "mismatch_level_list": "[0, 0, 0, 0, 0, 0, 1, 1]",
+            "Precision": "[nan, 1, 1, 1, 1, 1, 1]",
+            "Recall": "[nan, 1, 1, 1, 1, 1, 1]",
+            "F-measure": "[nan, 1, 1, 1, 1, 1, 1]",
+        }])
+        pla = novel_evaluation.extract_per_level_accuracy(df)
+        self.assertNotIn("match_ratio", pla.columns)
+
+    def test_per_level_metrics_separate_new_and_original_scoring(self):
+        # one match and one overclassification at species: the new Recall
+        # forgives the overclassification, the original does not
+        header = ["dataset", "level", "iteration", "method", "parameters",
+                  "observed_taxonomy", "expected_taxonomy", "result",
+                  "mismatch_level"]
+        matched = "A;B;C;D;E;F;G"
+        over_obs = "A;B;C;D;E;F;Z"
+        over_exp = "A;B;C;D;E;F"
+        rows = [
+            ["db1", "6", "0", "m", "p", matched, matched, "match", "7"],
+            ["db1", "6", "0", "m", "p", over_obs, over_exp,
+             "overclassification", "6"],
+        ]
+        with TemporaryDirectory() as tmp:
+            log_fp = join(tmp, "classification_accuracy_log.tsv")
+            with open(log_fp, "w") as f:
+                f.write("\t".join(header) + "\n")
+                for row in rows:
+                    f.write("\t".join(row) + "\n")
+            level_rows, _ = per_level_classification_ratios_from_log(log_fp)
+
+        species = {row["level"]: row for row in level_rows}[6]
+        self.assertEqual(species["n_match"], 1)
+        self.assertEqual(species["n_over"], 1)
+        self.assertEqual(species["FN"], 0)
+        self.assertEqual(species["FN_original"], 1)
+        self.assertEqual(species["Recall"], 1.0)
+        self.assertEqual(species["Recall_original"], 0.5)
+        self.assertEqual(species["Precision"], 0.5)
+        # match_ratio tracks the original scoring, not the new Recall
+        self.assertEqual(species["match_ratio"], 0.5)
 
     def test_classification_ratios_keep_novel_levels(self):
         header = ["dataset", "level", "iteration", "method", "parameters",

@@ -34,7 +34,7 @@ from seaborn import regplot
 from biom import load_table
 from biom.cli.util import write_biom_table
 from biom.parse import MetadataMap
-from numpy import random
+from numpy import isnan, nan, random
 from skbio import io
 import pandas as pd
 from sklearn.model_selection import KFold, StratifiedKFold
@@ -51,7 +51,8 @@ from tax_credit.taxa_manipulator import (accept_list_or_file,
                                          is_unassigned_taxon,
                                          trim_taxonomy_strings,
                                          truncate_taxa_to_reference,
-                                         extract_taxa_names)
+                                         extract_taxa_names,
+                                         project_taxon)
 from qiime2 import Artifact
 from qiime2.plugins import feature_classifier
 from q2_types.feature_data import DNAIterator
@@ -426,8 +427,9 @@ def generate_simulated_datasets(dataframe, data_dir, iterations,
         ``cross-validated-trad`` is in ``simulation_method``. See
         :func:`generate_cross_validated_trad_sequences`.
 
-        Changing this value does not by itself invalidate fold directories
-        that already exist on disk; pass ``force=True`` to rebuild them.
+        Fold contents are rewritten on every call, so a changed value takes
+        effect without ``force``; see
+        :func:`generate_cross_validated_trad_sequences`.
     '''
     allowed_methods = {
         'cross-validated-taxa',
@@ -1049,10 +1051,14 @@ def generate_cross_validated_trad_sequences(read_taxa, simulated_reads_fp, index
 
     Notes
     -----
-    Fold directories that already exist are rewritten in place, but nothing
-    keys off *query_size*, so changing it does not invalidate folds left over
-    from an earlier run with a different size. Pass ``force=True`` (Tourmaline:
-    ``force_regenerate: true``) when changing it.
+    Every fold's ``query.fasta`` and ``query_taxa.tsv`` are rewritten on each
+    call, so a changed *query_size* takes effect without any cache flag.
+    ``force`` here only deletes the shared ``_trad_cv_shared_ref_*.qza``
+    artifacts, which hold the full-database reference and do not depend on
+    *query_size*. (Under Tourmaline the catch is one level up: snakemake skips
+    ``tax_credit_prepare_datasets`` on a finished run, so delete
+    ``.datasets.done`` or use ``--forcerun`` to make this function run at all.
+    ``force_regenerate`` does not trigger it.)
     '''
     if iterations < 2:
         raise ValueError('Must perform two or more iterations for '
@@ -1530,82 +1536,130 @@ def count_records(record_counter, record_name, line_count):
     return ratio
 
 
-def precision_recall_fscore(exp, obs, sample_weight=None, exclude=None):
-    # precision, recall, fscore, calculated using microaveraging
+# Metric definitions live in tax_credit.metrics; re-exported here because this
+# module has long been the public home for them.
+from tax_credit.metrics import (  # noqa: F401
+    CLASSIFICATION_METRIC_COLUMNS,
+    CLASSIFICATION_OUTCOMES,
+    ORIGINAL_SCORE_COLUMNS,
+    OUTCOME_COUNT_COLUMNS,
+    RATIO_COLUMNS,
+    SCORE_COLUMNS,
+    SCORE_COUNT_COLUMNS,
+    metrics_from_outcomes,
+)
+
+
+def score_classifications(exp, obs, sample_weight=None, exclude=None):
+    '''Score observed against expected taxonomies, microaveraging over records.
+
+    exp, obs: list
+        Expected and observed taxonomy strings, aligned element by element.
+    sample_weight: array-like, optional
+        Weight per record, e.g. read counts. Defaults to 1 each, so every
+        record counts equally.
+    exclude: list, optional
+        Expected taxonomies to leave out of scoring.
+
+    Returns the dict described by :func:`metrics_from_outcomes`.
+    '''
     if exclude is None:
         exclude = []
     if sample_weight is None:
-        sample_weight = [1]*len(exp)
-    tp, fp, fn = 0, 0, 0
+        sample_weight = [1] * len(exp)
+    outcomes = dict.fromkeys(CLASSIFICATION_OUTCOMES, 0.)
     for e, o, w in zip(exp, obs, sample_weight):
         if e in exclude:
             continue
-        classification = evaluate_classification(o, e)
-        if classification == 'match':
-            # tp for the true class, the rest are tn
-            tp += w
-        elif classification == 'underclassification':
-            # fn for the true class
-            fn += w
-            # no fp for the predicted class, because it was right to some level
-            # the rest are tn
-        else:
-            # fp the the predicted class
-            fp += w
-            # fn for the true class, the rest are tn
-            fn += w
-    if tp == 0:
-        return 0, 0, 0
-    p = tp / (tp + fp)
-    r = tp / (tp + fn)
-    f = 2.*p*r / (p + r)
-    return p, r, f
+        outcomes[evaluate_classification(o, e)] += w
+    return metrics_from_outcomes(**outcomes)
+
+
+def precision_recall_fscore(exp, obs, sample_weight=None, exclude=None):
+    '''Precision, recall and F-measure only; see :func:`score_classifications`.
+
+    Kept for callers that want the three headline scores. Note that *recall*
+    here is the new definition, which forgives overclassification.
+    '''
+    scores = score_classifications(
+        exp, obs, sample_weight=sample_weight, exclude=exclude)
+    return scores['Precision'], scores['Recall'], scores['F-measure']
 
 
 def compute_prf(exp, obs, test_type='cross-validated',
                 l_range=range(1, 7), sample_weight=None, exclude=None):
-    '''Compute precision, recall, and F-measure using sklearn.
-    exp_taxa: list
+    '''Compute classification metrics, by taxonomic level where applicable.
+    exp: list
         Expected observations for each sample (sequence).
-    obs_taxa: list
+    obs: list
         Predicted observations for each sample (sequence).
-    avg: str
-        Score averaging method using in sklearn. 'micro', 'weighted', or
-        'macro'.
     test_type: str
-        'novel-taxa', 'cross-validated', 'cross-validated-trad', or
-        'self-validated'.
+        'novel-taxa', 'cross-validated', 'cross-validated-trad',
+        'self-validated', or 'mock'.
     l_range: range
-        Range of taxonomic levels for ``cross-validated`` and
-        ``cross-validated-trad``.
+        Taxonomic levels to score for the cross-validated and self-validated
+        types. 0 = kingdom ... 6 = species.
     sample_weight: array-like of shape = [n_samples], optional
         Sample weights.
+    exclude: list, optional
+        Expected taxonomies to leave out of scoring.
+
+    Returns a dict keyed by ``CLASSIFICATION_METRIC_COLUMNS``. For
+    'novel-taxa' and 'mock' each value is a single score over the full-depth
+    taxonomy. For the cross-validated and self-validated types each value is a
+    list of seven, indexed by taxonomic level; levels outside *l_range* are
+    NaN because they were never scored. Each level is scored independently, on
+    taxonomies truncated to that depth.
     '''
 
     if test_type in ('mock', 'novel-taxa'):
-        p, r, f = precision_recall_fscore(
+        return score_classifications(
             exp, obs, sample_weight=sample_weight, exclude=exclude)
     elif test_type in ('cross-validated', 'cross-validated-trad',
                        'self-validated'):
-        # initialize p/r/f as lists of 0s, representing each taxonomic level.
-        p, r, f = [0] * 7, [0] * 7, [0] * 7
+        # one list per metric, holding a value for each taxonomic level
+        metrics = {column: [nan] * 7
+                   for column in CLASSIFICATION_METRIC_COLUMNS}
         # iterate over multiple taxonomic levels
         for lvl in l_range:
             _obs = extract_taxa_names(obs, level=slice(0, lvl+1))
             _exp = extract_taxa_names(exp, level=slice(0, lvl+1))
-            p[lvl], r[lvl], f[lvl] = precision_recall_fscore(
+            scores = score_classifications(
                 _exp, _obs, sample_weight=sample_weight, exclude=exclude)
+            for column, value in scores.items():
+                metrics[column][lvl] = value
+        return metrics
     else:
         raise ValueError(
             'test_type must be "novel-taxa", "cross-validated", '
             '"cross-validated-trad", "self-validated", or "mock".')
 
-    return p, r, f
 
+def load_prf(obs_fp, exp_fp, level=slice(0, 7), sort=True,
+             rank_positions=None):
+    '''Load expected and observed taxonomies, aligned by sequence ID.
 
-def load_prf(obs_fp, exp_fp, level=slice(0, 7), sort=True):
-    exp_taxa = load_taxa(exp_fp, level=level, sort=sort)
-    obs_taxa = load_taxa(obs_fp, level=level, sort=sort)
+    rank_positions: list of int, optional
+        Rank positions to keep from each taxonomy string, in place of *level*,
+        for a database whose taxonomy is not the standard seven ranks (see
+        ``taxa_manipulator.project_taxon``). Must select seven positions.
+    '''
+    if rank_positions is None:
+        exp_taxa = load_taxa(exp_fp, level=level, sort=sort)
+        obs_taxa = load_taxa(obs_fp, level=level, sort=sort)
+    else:
+        exp_taxa = load_taxa(exp_fp, level=slice(None), sort=sort)
+        obs_taxa = load_taxa(obs_fp, level=slice(None), sort=sort)
+        # more ranks than declared means the positions point at the wrong ranks
+        n_declared = max(rank_positions) + 1
+        deepest = max((len(t.split(';')) for t in exp_taxa), default=0)
+        if deepest > n_declared:
+            raise ValueError(
+                '{0} holds taxonomies with {1} ranks, but rank_positions '
+                'only reaches rank {2}; check the taxa_ranks declared for '
+                'this database.'.format(exp_fp, deepest, n_declared))
+        exp_taxa = [project_taxon(t, rank_positions) for t in exp_taxa]
+        obs_taxa = [project_taxon(t, rank_positions) for t in obs_taxa]
 
     # raise error if obs_taxa and exp_taxa are not same length
     if len(obs_taxa) != len(exp_taxa):

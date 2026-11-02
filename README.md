@@ -15,6 +15,7 @@ Tourmaline's `scripts/run_tax_credit.py` imports it and runs the whole benchmark
 - **Trimmed to what Tourmaline uses.** The legacy notebook-only modules (`eval_framework`, `mock_evaluation`, `biom_cache`, `process_mocks`, `mock_denoise`, `mock_transport`, `mock_quality`, `mockrobiota_extract`, `simulated_communities`) have been removed. See [Package layout](#package-layout) for what remains.
 - **New evaluation modes.** Random-split cross-validation (`cross-validated-trad`, with a configurable query-set size) and running a full database against itself (`self-validated`) have been added alongside the original taxonomy-stratified folds, with shared reference artifacts to avoid duplicating a database per fold.
 - **New mock-community implementation.** `tax_credit.mock_community` replaces the old `mock_evaluation` / `eval_framework` scoring path, and works from feature tables, ASV sequences and expected composition or per-ASV "trueish" taxonomies.
+- **Revised scoring.** Overclassification — assigning deeper than the reference knows — is a false positive but no longer a false negative, so it lowers precision and F-measure but not recall. The original scoring is still reported as `Recall_original` / `F-measure_original`, alongside the raw tallies, and scores with nothing to score are NaN rather than 0. Definitions live in `tax_credit.metrics`; see [docs/overview.md](docs/overview.md#scoring).
 - **Log analysis and plot theming.** `tax_credit.log_analysis`, `tax_credit.log_plotting` and `tax_credit.plot_theme` were added to summarize per-taxon classifier behaviour and to give the generated figures a consistent look.
 - **Modernized environment.** Targets QIIME 2 amplicon 2024.10 (Python 3.10). 
 
@@ -28,11 +29,11 @@ conda env create -n qiime2-amplicon-2024.10 \
 conda activate qiime2-amplicon-2024.10
 
 git clone https://github.com/ksil-NOAA/tour2-tax-credit.git tax-credit
-cd tour2-tax-credit
+cd tax-credit
 pip install -e .
 ```
 
-Clone it as a sibling of your Tourmaline directory — Tourmaline's `tax_credit_package_dir` defaults to `../tour2-tax-credit`.
+Clone it as a sibling of your Tourmaline directory — Tourmaline's `tax_credit_package_dir` defaults to `../tax-credit`.
 
 See [docs/installation.md](docs/installation.md) for platform-specific environment files and the non-conda fallback.
 
@@ -54,7 +55,7 @@ This mode holds out the query *list* but **not the reference**. Each fold's `ref
 
 Read its scores as a **ceiling measured on a random subset** rather than as cross-validated performance: they are optimistically biased, and fold-to-fold spread understates real variance. Use `cross-validated` (taxonomy-aware) when you want queries genuinely absent from the fold's reference.
 
-By default the whole database is divided between the folds, so each queries `n_sequences / iterations` sequences. Tourmaline's `trad_cv_query_size` shrinks the **total** query pool instead, which is then divided the same way — a **float** in (0, 1] is a **fraction** of the database, an **int** is an **absolute count**, and both describe the total across all folds rather than one fold. With `trad_cv_query_size: 0.2` and `iterations: 8`, 20% of the database is queried in total and each fold holds 2.5% of it. An int larger than a given database warns and uses that whole database instead, so one int can be shared across databases of different sizes. Folds stay disjoint either way. Changing it on a run whose folds already exist requires `force_regenerate: true`, or the old folds are reused at their previous size.
+By default the whole database is divided between the folds, so each queries `n_sequences / iterations` sequences. Tourmaline's `trad_cv_query_size` shrinks the **total** query pool instead, which is then divided the same way — a **float** in (0, 1] is a **fraction** of the database, an **int** is an **absolute count**, and both describe the total across all folds rather than one fold. With `trad_cv_query_size: 0.2` and `iterations: 8`, 20% of the database is queried in total and each fold holds 2.5% of it. An int larger than a given database warns and uses that whole database instead, so one int can be shared across databases of different sizes. Folds stay disjoint either way. Changing it takes effect the next time Tourmaline's datasets phase runs; on a run that already finished, delete `.datasets.done` or pass `--forcerun tax_credit_prepare_datasets`.
 
 ## Package layout
 
@@ -62,6 +63,7 @@ By default the whole database is divided between the folds, so each queries `n_s
 |---|---|
 | `framework_functions` | Dataset simulation, parameter sweeps, classification command generation |
 | `novel_evaluation` | Scoring for novel-taxa and cross-validated assignments; best-run selection |
+| `metrics` | Definitions of every per-sequence classification metric (`metrics_from_outcomes`) |
 | `mock_community` | Mock-community scoring (precision/recall, taxon detection, Bray-Curtis) |
 | `log_analysis`, `log_plotting` | Per-taxon classifier behaviour summaries and their figures |
 | `plotting_functions`, `plot_theme` | Metric plots and shared figure styling |

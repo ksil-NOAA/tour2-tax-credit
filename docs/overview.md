@@ -28,7 +28,7 @@ Simulations split a reference database into **query** (test) and **reference** (
 
   **`query_size`** (Tourmaline: `trad_cv_query_size`) sets the size of the **total query pool**, which is then divided evenly between the `iterations` folds. A float in `(0, 1]` is a fraction of the database; an int is an absolute number of sequences. Both describe the total across all folds, not the size of one fold — with `query_size=0.2` and `iterations=8`, 20% of the database is queried in total and each fold holds 20%/8 = 2.5% of it. Left unset, the pool is the whole database (equivalent to `query_size=1.0`), giving the historical `n_sequences / iterations` per fold. An int larger than a given database warns and falls back to that whole database, so a single int can be shared across databases of different sizes.
 
-  A random pool of the requested size is drawn with a fixed seed, then split with `KFold(n_splits=iterations, shuffle=True)`, so folds are always disjoint and together cover the pool exactly once; they differ by at most one sequence when the pool does not divide evenly. Changing `query_size` does not invalidate fold directories from an earlier run; pass `force=True` (`force_regenerate: true`) to rebuild them.
+  A random pool of the requested size is drawn with a fixed seed, then split with `KFold(n_splits=iterations, shuffle=True)`, so folds are always disjoint and together cover the pool exactly once; they differ by at most one sequence when the pool does not divide evenly. Every fold's query files are rewritten on each call, so a changed `query_size` takes effect without any cache flag — `force` only rebuilds the shared full-database reference artifacts. Under Tourmaline the catch is one level up: snakemake skips the datasets phase on a finished run, so delete `.datasets.done` or pass `--forcerun tax_credit_prepare_datasets`.
 
   Shared **`ref_seqs.qza`** / **`ref_taxa.qza`** artifacts under `ref_dbs/` reduce duplication across folds (see [directory-layout.md](directory-layout.md)).
 
@@ -37,6 +37,19 @@ The legacy alias **`cross-validated`** means **`cross-validated-taxa`**.
 ### Novel-taxa simulations
 
 **Queries with no exact match in the reference.** Reference sequences that share the query taxonomy are removed; correct behavior is often assignment to the **last common ancestor** (LCA). Metrics emphasize match vs. overclassification vs. underclassification vs. misclassification, summarized in classification logs and aggregate tables.
+
+## Scoring
+
+Every assignment, whether a simulated query or a mock-community ASV, is one of four outcomes: *match*, *underclassification* (correct but shallower than expected), *overclassification* (deeper than the expected taxonomy goes) or *misclassification* (a wrong name at some rank). Precision, recall and F-measure are computed from those tallies in one place, `metrics.metrics_from_outcomes`:
+
+- match is a true positive;
+- underclassification is a false negative;
+- misclassification is both a false positive and a false negative;
+- overclassification is a false positive **only**.
+
+The last point departs from the original tax-credit, which also counted overclassification as a false negative. Assigning deeper than the reference knows now lowers precision, and so F-measure, but not recall. The original scoring is still reported as `Recall_original` and `F-measure_original`, together with the raw tallies (`TP`, `FP`, `FN`, `FN_original`), for comparison and audit; those columns are never plotted or used to rank runs. `match_ratio` equals `Recall_original`; the new `Recall` is `match_ratio / (1 − overclassification_ratio)`.
+
+A score whose denominator is empty is NaN rather than 0, so "nothing to score" (for example precision when every assignment was underclassified) is distinguishable from "everything was wrong". Scores produced before this revision are not comparable with new ones; re-score old results with the current code rather than reading their old summaries.
 
 ## Data flow (high level)
 
