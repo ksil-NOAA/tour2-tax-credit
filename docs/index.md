@@ -15,8 +15,8 @@ This is the **Tourmaline-integrated fork** of [caporaso-lab/tax-credit](https://
 
 ## Quick start
 
-1. Create a [QIIME 2 amplicon](https://docs.qiime2.org/) environment (2024.10, Python 3.10).
-2. From the repository root: `pip install -e .`
+1. Create a [QIIME 2 amplicon](https://docs.qiime2.org/) environment (2024.10, Python 3.10), named `qiime2-amplicon-2024.10` as Tourmaline expects.
+2. Clone this repository's `tour2-tax-credit` branch next to Tourmaline. No install is needed for Tourmaline; `pip install -e .` only if you will import `tax_credit` yourself.
 3. Point `tax_credit_package_dir` in Tourmaline's `config_04_tax_credit.yaml` at this clone.
 4. From the Tourmaline directory: `./tourmaline.sh --step tax-credit --configfile config_04_tax_credit.yaml --cores 8`
 

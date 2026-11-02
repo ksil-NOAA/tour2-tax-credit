@@ -4,7 +4,9 @@ tax-credit is a Python library used alongside a scientific stack for BIOM tables
 
 ## Recommended: QIIME 2 amplicon 2024.10
 
-The package is designed to install **into** an existing QIIME 2 amplicon environment so duplicate PyPI dependencies are avoided.
+The package runs **inside** an existing QIIME 2 amplicon environment so duplicate PyPI dependencies are avoided.
+
+> **Using it through Tourmaline? Skip the install.** Clone the `tour2-tax-credit` branch and point Tourmaline's `tax_credit_package_dir` at the clone (see [Use from Tourmaline](#use-from-tourmaline)). Tourmaline imports the package from that directory itself, inside its own `qiime2-amplicon-2024.10` environment. The steps below are for importing `tax_credit` yourself — in notebooks or interactive work.
 
 1. **Create and activate** a conda environment from the official QIIME 2 amplicon distribution for your platform. Example files (adjust for OS/arch):
 
@@ -17,7 +19,7 @@ The package is designed to install **into** an existing QIIME 2 amplicon environ
    conda activate taxCredit-q2-2024.10
    ```
 
-2. **Install tax-credit** in editable mode from the repository root:
+2. **Install tax-credit** in editable mode from the repository root (not needed for Tourmaline):
 
    ```bash
    cd tax-credit
@@ -54,7 +56,7 @@ Some classify methods run in their own conda environments rather than the QIIME 
 
 ## Use from Tourmaline
 
-Point `tax_credit_package_dir` in `config_04_tax_credit.yaml` at this clone (default `../tax-credit`), then run the benchmark from the Tourmaline directory:
+No install is needed. Clone the `tour2-tax-credit` branch, point `tax_credit_package_dir` in `config_04_tax_credit.yaml` at the clone (default `../tax-credit`, resolved from the Tourmaline directory), then run the benchmark from the Tourmaline directory:
 
 ```bash
 conda activate snakemake-tour2

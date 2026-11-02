@@ -23,17 +23,21 @@ Tourmaline's `scripts/run_tax_credit.py` imports it and runs the whole benchmark
 
 This package expects the scientific stack from a QIIME 2 amplicon environment; it declares no PyPI dependencies of its own.
 
-```bash
-conda env create -n qiime2-amplicon-2024.10 \
-  --file https://data.qiime2.org/distro/amplicon/qiime2-amplicon-2024.10-py310-osx-conda.yml
-conda activate qiime2-amplicon-2024.10
+**For Tourmaline, just clone it** — there is nothing to install. Tourmaline imports the package directly from the directory named by `tax_credit_package_dir`, inside its `qiime2-amplicon-2024.10` environment:
 
-git clone https://github.com/ksil-NOAA/tour2-tax-credit.git tax-credit
-cd tax-credit
-pip install -e .
+```bash
+cd ..    # alongside your tourmaline clone
+git clone -b tour2-tax-credit https://github.com/ksil-NOAA/tour2-tax-credit.git tax-credit
 ```
 
-Clone it as a sibling of your Tourmaline directory — Tourmaline's `tax_credit_package_dir` defaults to `../tax-credit`.
+Clone it as a sibling of your Tourmaline directory — Tourmaline's `tax_credit_package_dir` defaults to `../tax-credit`. Keep it up to date with Tourmaline; the two change together.
+
+**To import `tax_credit` yourself** (notebooks, the unit tests from another directory), install it in editable mode into a QIIME 2 amplicon environment:
+
+```bash
+conda activate qiime2-amplicon-2024.10
+pip install -e tax-credit
+```
 
 See [docs/installation.md](docs/installation.md) for platform-specific environment files and the non-conda fallback.
 
