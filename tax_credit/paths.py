@@ -52,6 +52,10 @@ CLASSIFICATION_METRICS_TSV = "classification_metrics.tsv"
 REF_SEQS_FASTA = "ref_seqs.fasta"
 QUERY_FASTA = "query.fasta"
 REF_TAXA_TSV = "ref_taxa.tsv"
+# Uncapped query set, kept beside a fold capped by max_query_size_per_fold.
+# Only present while a cap is in effect; the capped files keep the names above.
+QUERY_FULL_FASTA = "query_full.fasta"
+QUERY_FULL_TAXA_TSV = "query_full_taxa.tsv"
 
 
 class MockResultTableParts(NamedTuple):

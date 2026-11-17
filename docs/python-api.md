@@ -214,25 +214,25 @@ Backward compatibility: `cross-validated` is treated as an alias of `cross-valid
 
 A fold left with no queries at all still raises, since it cannot be evaluated. `cross-validated-trad` and `self-validated` never drop anything: their reference is the whole database, so every query's full lineage is present by construction.
 
-### `trad_cv_query_size` (cross-validated-trad query pool)
+### `max_query_size_per_fold` (per-fold query cap)
 
-`generate_simulated_datasets(..., trad_cv_query_size=None)` forwards to `generate_cross_validated_trad_sequences(..., query_size=...)`. It sizes the **total query pool**, which is then divided evenly between the `iterations` folds — it is *not* the size of one fold. Other simulation methods ignore it.
+`generate_simulated_datasets(..., max_query_size_per_fold=None)` caps the number of query sequences scored in **each** fold of `cross-validated-taxa`, `cross-validated-trad` and `novel-taxa`. `self-validated` is never capped. It replaces the old `trad_cv_query_size` / `query_size` argument, which sized the total trad-only query pool and has been removed.
 
-| Value | Total pool | Per fold (with `iterations=8`) |
-|---|---|---|
-| `None` (default) | The whole database. | `n_sequences / 8`, i.e. 12.5% of the database. |
-| float in `(0, 1]` | That **fraction** of the database — `0.2` is 20% of sequences. | 20%/8 = **2.5%** of the database. |
-| int | That **absolute number** of sequences — `8000` is 8000 sequences. | 8000/8 = **1000** sequences. |
+| Value | Effect |
+|---|---|
+| `None`, `0` or `''` (default) | No cap. Each fold keeps all of its queries, about `n_sequences / iterations`. |
+| positive int | Each fold holding more queries than this is cut down to that many. Smaller folds are unchanged. |
 
-`1.0` is accepted and means the whole database, so it behaves exactly like the default.
+The cap runs after each database's folds are written, through `cap_fold_queries(fold_dir, max_queries)`:
 
-An **int larger than a given database** is not an error: a `WARNING:` is printed and that whole database is used as the pool. This is what makes one int usable across databases of different sizes — every database big enough supplies the same query count, and smaller ones contribute everything they have (the warning says so, since their query counts will not match).
+- **Order.** Novel-taxa folds are derived from the **full** cross-validated folds, which are capped afterwards.
+- **Backups.** With a cap in effect, the full query set is copied to `query_full.fasta` / `query_full_taxa.tsv`. If the fold is over the cap, `query.fasta`, `query_taxa.tsv` and `query.qza` are rewritten to a random subset, drawn without replacement with a seed derived from the fold's directory name. Reruns therefore pick the same queries, in their original order.
+- **References.** `ref_*` files are never touched. In trad and self-validated folds they are symlinks to the shared database. Queries left out are not returned to the reference, since that would score the remaining queries against their near relatives.
+- **No cap.** Folds are left as generated, and `query_full_*` files from an earlier capped run are removed.
 
-In every case a random pool of the requested size is drawn with a fixed seed, then split with `KFold(n_splits=iterations, shuffle=True, random_state=0)`. Folds are therefore always **disjoint** and together cover the pool exactly once, differing by at most one sequence when the pool does not divide evenly.
+`validate_max_query_size_per_fold(value)` normalises the setting, returning `None` or a positive int. It raises `ValueError` for a negative number, a float (fractions are no longer accepted), a numeric string or a bool. `generate_simulated_datasets` calls it before doing any work.
 
-`ValueError` is raised, with a message naming both the float and int readings, for: a float at or below 0 or above 1; an int below 1; a non-numeric type; and any value whose resolved pool would be smaller than `iterations` (some fold would get no sequences) — including a database with fewer sequences than `iterations`.
-
-Fold contents are rewritten on every call, so a changed `query_size` takes effect with no cache flag; `force` only rebuilds the shared full-database reference artifacts. Under Tourmaline, snakemake skips `tax_credit_prepare_datasets` on a run that already finished — delete `.datasets.done` or pass `--forcerun tax_credit_prepare_datasets`. `force_regenerate: true` does neither.
+Fold contents are rewritten on every call, so a changed value takes effect with no cache flag. Under Tourmaline, snakemake skips `tax_credit_prepare_datasets` on a run that already finished, so delete `.datasets.done` or pass `--forcerun tax_credit_prepare_datasets`. `force_regenerate: true` does neither.
 
 ---
 

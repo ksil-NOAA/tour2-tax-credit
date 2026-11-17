@@ -19,8 +19,11 @@ from io import StringIO
 from unittest import TestCase, main
 import pandas as pd
 from numpy import isnan, nan
+from qiime2 import Artifact
+from q2_types.feature_data import DNAIterator
 from tempfile import mkdtemp
 from tax_credit.framework_functions import (
+    validate_max_query_size_per_fold,
     generate_novel_sequence_sets,
     generate_simulated_datasets,
     clean_database,
@@ -33,6 +36,8 @@ from tax_credit.framework_functions import (
 )
 from tax_credit.paths import (
     QUERY_FASTA,
+    QUERY_FULL_FASTA,
+    QUERY_FULL_TAXA_TSV,
     QUERY_TAXA_TSV,
     QUERY_TAX_ASSIGNMENTS_TXT,
     REF_SEQS_FASTA,
@@ -519,7 +524,7 @@ class EvalFrameworkTests(TestCase):
         '''Build the single-database frame used by the trad-CV tests.'''
         copy(join(self.tmpdir, 'ref1.txt'), join(tmp, 'ref1.txt'))
         qdir = join(tmp, 'B1-REF-L6-iter0')
-        makedirs(qdir)
+        makedirs(qdir, exist_ok=True)
         copy(self.query_fp, join(qdir, QUERY_TAXA_TSV))
         ref_data = pd.DataFrame.from_dict(
             {'B1-REF': [
@@ -543,13 +548,12 @@ class EvalFrameworkTests(TestCase):
         ]
         return ref_data
 
-    def _run_trad(self, tmp, iterations=2, query_size=None):
+    def _run_trad(self, tmp, iterations=2):
         '''Generate trad-CV folds; return (query id sets, n simulated reads).'''
         generate_simulated_datasets(
             self._trad_ref_data(tmp), tmp, iterations, read_length=100,
             levelrange=range(6, 5, -1), trim_primers=False,
-            simulation_method='cross-validated-trad',
-            trad_cv_query_size=query_size)
+            simulation_method='cross-validated-trad')
         trad = cross_validated_trad_root(tmp)
         fold_queries = [
             set(import_to_list(
@@ -561,8 +565,8 @@ class EvalFrameworkTests(TestCase):
             '515f', '806r', trim_primers=False))
         return fold_queries, n_reads
 
-    def test_trad_query_size_default_pools_whole_database(self):
-        """query_size=None divides the whole database between the folds."""
+    def test_trad_folds_partition_whole_database(self):
+        """Uncapped, trad-CV divides the whole database between the folds."""
         tmp = mkdtemp()
         try:
             folds, n_reads = self._run_trad(tmp, iterations=2)
@@ -574,56 +578,11 @@ class EvalFrameworkTests(TestCase):
         finally:
             rmtree(tmp)
 
-    def test_trad_query_size_float_is_fraction_of_total_pool(self):
-        """A float is the TOTAL fraction queried, split between the folds."""
+    def test_trad_keeps_full_reference(self):
+        """Each trad fold's reference is the whole database, queries included."""
         tmp = mkdtemp()
         try:
-            folds, n_reads = self._run_trad(tmp, iterations=2, query_size=0.5)
-            pool = folds[0] | folds[1]
-            # Half the database in total...
-            self.assertEqual(len(pool), round(0.5 * n_reads))
-            # ...divided between the two folds, so a quarter each.
-            self.assertEqual(folds[0] & folds[1], set())
-            for fold in folds:
-                self.assertEqual(len(fold), round(0.5 * n_reads) // 2)
-        finally:
-            rmtree(tmp)
-
-    def test_trad_query_size_int_is_absolute_total_count(self):
-        """An int is the TOTAL number of sequences, not a per-fold count."""
-        tmp = mkdtemp()
-        try:
-            total = 4
-            folds, n_reads = self._run_trad(
-                tmp, iterations=2, query_size=total)
-            pool = folds[0] | folds[1]
-            self.assertEqual(len(pool), total)
-            self.assertEqual(folds[0] & folds[1], set())
-            for fold in folds:
-                self.assertEqual(len(fold), total // 2)
-            # Smaller than the whole database, which the default would use.
-            self.assertLess(len(pool), n_reads)
-        finally:
-            rmtree(tmp)
-
-    def test_trad_query_size_one_point_zero_matches_default(self):
-        """query_size=1.0 means the whole database, i.e. the default."""
-        tmp_default = mkdtemp()
-        tmp_explicit = mkdtemp()
-        try:
-            default, _ = self._run_trad(tmp_default, iterations=2)
-            explicit, _ = self._run_trad(
-                tmp_explicit, iterations=2, query_size=1.0)
-            self.assertEqual(default, explicit)
-        finally:
-            rmtree(tmp_default)
-            rmtree(tmp_explicit)
-
-    def test_trad_query_size_keeps_full_reference(self):
-        """The reference stays the whole database regardless of query_size."""
-        tmp = mkdtemp()
-        try:
-            self._run_trad(tmp, iterations=2, query_size=4)
+            self._run_trad(tmp, iterations=2)
             trad = cross_validated_trad_root(tmp)
             clean_taxa_path = join(
                 ref_dbs_root(tmp), 'ref1', 'query_taxa_clean.tsv')
@@ -644,54 +603,195 @@ class EvalFrameworkTests(TestCase):
         finally:
             rmtree(tmp)
 
-    def test_trad_query_size_larger_than_database_uses_whole_database(self):
-        """An int bigger than the database warns and falls back to all of it."""
-        tmp = mkdtemp()
+    # --- max_query_size_per_fold -------------------------------------------
+
+    _CAP_METHODS = ['cross-validated-taxa', 'cross-validated-trad',
+                    'novel-taxa']
+
+    def _generate_capped(self, tmp, cap, methods=None):
+        '''Build every capped simulation for one database; return stdout.'''
+        buf = StringIO()
+        with redirect_stdout(buf):
+            generate_simulated_datasets(
+                self._trad_ref_data(tmp), tmp, 2, read_length=100,
+                levelrange=range(6, 5, -1), trim_primers=False,
+                simulation_method=methods or self._CAP_METHODS,
+                max_query_size_per_fold=cap)
+        return buf.getvalue()
+
+    @staticmethod
+    def _cap_fold_names():
+        '''(root function, fold basename) for every fold the cap applies to.'''
+        names = []
+        for i in range(2):
+            names.append((cross_validated_root, 'B1-REF-iter{0}'.format(i)))
+            names.append((cross_validated_trad_root,
+                          'B1-REF-iter{0}'.format(i)))
+            names.append((novel_taxa_simulations_root,
+                          'B1-REF-L6-iter{0}'.format(i)))
+        return names
+
+    @staticmethod
+    def _read(fp):
+        with open(fp) as fh:
+            return fh.read()
+
+    @staticmethod
+    def _qza_ids(fp):
+        return [seq.metadata['id']
+                for seq in Artifact.load(fp).view(DNAIterator)]
+
+    def test_query_cap_limits_every_simulated_fold(self):
+        '''Each cv, trad and novel fold scores at most the cap, refs untouched.'''
+        cap = 2
+        full_tmp, capped_tmp = mkdtemp(), mkdtemp()
         try:
-            buf = StringIO()
-            with redirect_stdout(buf):
-                folds, n_reads = self._run_trad(
-                    tmp, iterations=2, query_size=9999)
-            output = buf.getvalue()
-            # warned, naming the oversized request and the real database size
-            self.assertIn('WARNING', output)
-            self.assertIn('9999', output)
-            self.assertIn(str(n_reads), output)
-            # and fell back to the whole database, as query_size=None would
-            pool = folds[0] | folds[1]
-            self.assertEqual(len(pool), n_reads)
-            self.assertEqual(folds[0] & folds[1], set())
-            default, _ = self._run_trad(mkdtemp(), iterations=2)
-            self.assertEqual(folds, default)
+            self._generate_capped(full_tmp, None)
+            output = self._generate_capped(capped_tmp, cap)
+            n_capped = 0
+            for root, name in self._cap_fold_names():
+                full = join(root(full_tmp), name)
+                capped = join(root(capped_tmp), name)
+                full_lines = import_to_list(join(full, QUERY_TAXA_TSV))
+                kept_lines = import_to_list(join(capped, QUERY_TAXA_TSV))
+                kept_ids = [line.split('\t')[0] for line in kept_lines]
+
+                # the uncapped query set is kept, byte for byte
+                self.assertEqual(
+                    self._read(join(capped, QUERY_FULL_TAXA_TSV)),
+                    self._read(join(full, QUERY_TAXA_TSV)))
+                self.assertEqual(
+                    self._read(join(capped, QUERY_FULL_FASTA)),
+                    self._read(join(full, QUERY_FASTA)))
+
+                # at most the cap, drawn from the full set with taxonomy as-is
+                self.assertEqual(len(kept_lines), min(len(full_lines), cap))
+                self.assertTrue(set(kept_lines).issubset(full_lines))
+                # original order preserved
+                self.assertEqual(
+                    kept_lines, [l for l in full_lines if l in kept_lines])
+                if len(full_lines) > cap:
+                    n_capped += 1
+                    self.assertIn(name, output)
+
+                # fasta, taxonomy and artifact agree on the queries
+                self.assertEqual(
+                    extract_fasta_ids(join(capped, QUERY_FASTA)),
+                    set(kept_ids))
+                # (generators write the fasta and taxonomy in different
+                # orders; the artifact follows the fasta)
+                self.assertEqual(
+                    sorted(self._qza_ids(join(capped, 'query.qza'))),
+                    sorted(kept_ids))
+
+                # references are exactly what the uncapped run built
+                for ref in (REF_SEQS_FASTA, REF_TAXA_TSV):
+                    self.assertEqual(self._read(join(capped, ref)),
+                                     self._read(join(full, ref)))
+                if root is cross_validated_trad_root:
+                    self.assertTrue(islink(join(capped, REF_SEQS_FASTA)))
+                    self.assertTrue(islink(join(capped, REF_TAXA_TSV)))
+            # the fixture must actually exercise the cap
+            self.assertGreater(n_capped, 0)
         finally:
+            rmtree(full_tmp)
+            rmtree(capped_tmp)
+
+    def test_query_cap_novel_taxa_only(self):
+        '''novel-taxa alone is capped too, built from the full temporary folds.'''
+        cap = 2
+        full_tmp, capped_tmp = mkdtemp(), mkdtemp()
+        try:
+            self._generate_capped(full_tmp, None, methods=['novel-taxa'])
+            self._generate_capped(capped_tmp, cap, methods=['novel-taxa'])
+            self.assertFalse(exists(cross_validated_root(capped_tmp)) and
+                             glob(join(cross_validated_root(capped_tmp), '*')))
+            for i in range(2):
+                name = 'B1-REF-L6-iter{0}'.format(i)
+                full = join(novel_taxa_simulations_root(full_tmp), name)
+                capped = join(novel_taxa_simulations_root(capped_tmp), name)
+                self.assertEqual(
+                    self._read(join(capped, QUERY_FULL_TAXA_TSV)),
+                    self._read(join(full, QUERY_TAXA_TSV)))
+                n_full = len(import_to_list(join(full, QUERY_TAXA_TSV)))
+                self.assertEqual(
+                    len(import_to_list(join(capped, QUERY_TAXA_TSV))),
+                    min(n_full, cap))
+        finally:
+            rmtree(full_tmp)
+            rmtree(capped_tmp)
+
+    def test_query_cap_is_reproducible(self):
+        '''The same cap picks the same queries on every run.'''
+        first, second = mkdtemp(), mkdtemp()
+        try:
+            self._generate_capped(first, 2)
+            self._generate_capped(second, 2)
+            for root, name in self._cap_fold_names():
+                self.assertEqual(
+                    self._read(join(root(first), name, QUERY_TAXA_TSV)),
+                    self._read(join(root(second), name, QUERY_TAXA_TSV)))
+        finally:
+            rmtree(first)
+            rmtree(second)
+
+    def test_query_cap_larger_than_fold_keeps_every_query(self):
+        '''A cap no fold reaches changes no query set, but keeps the backup.'''
+        full_tmp, capped_tmp = mkdtemp(), mkdtemp()
+        try:
+            self._generate_capped(full_tmp, None)
+            self._generate_capped(capped_tmp, 10 ** 6)
+            for root, name in self._cap_fold_names():
+                full = join(root(full_tmp), name)
+                capped = join(root(capped_tmp), name)
+                for fp in (QUERY_TAXA_TSV, QUERY_FASTA):
+                    self.assertEqual(self._read(join(capped, fp)),
+                                     self._read(join(full, fp)))
+                self.assertTrue(exists(join(capped, QUERY_FULL_FASTA)))
+                self.assertTrue(exists(join(capped, QUERY_FULL_TAXA_TSV)))
+        finally:
+            rmtree(full_tmp)
+            rmtree(capped_tmp)
+
+    def test_query_cap_off_matches_uncapped_and_clears_backups(self):
+        '''0, blank and None all mean no cap; turning it off removes backups.'''
+        reference, tmp = mkdtemp(), mkdtemp()
+        try:
+            self._generate_capped(reference, None)
+            # a capped run first, so the backups exist...
+            self._generate_capped(tmp, 2)
+            for off in (0, '', None):
+                # ...then each "off" value rebuilds the full folds in place
+                self._generate_capped(tmp, off)
+                for root, name in self._cap_fold_names():
+                    fold = join(root(tmp), name)
+                    self.assertFalse(exists(join(fold, QUERY_FULL_FASTA)))
+                    self.assertFalse(exists(join(fold, QUERY_FULL_TAXA_TSV)))
+                    for fp in (QUERY_TAXA_TSV, QUERY_FASTA):
+                        self.assertEqual(
+                            self._read(join(fold, fp)),
+                            self._read(join(root(reference), name, fp)))
+        finally:
+            rmtree(reference)
             rmtree(tmp)
 
-    def test_trad_query_size_rejects_invalid_values(self):
-        """Bad query_size values raise, naming both the float and int reading."""
-        cases = [
-            (1.5, 'at most 1'),            # float may not exceed the database
-            (0.0, 'greater than 0'),
-            (-0.5, 'greater than 0'),
-            (0, 'at least 1'),             # int must be >= 1
-            ('0.1', 'must be a float, an int, or None'),
-            (True, 'must be a float or an int'),
-            # a pool too small to give every fold at least one sequence
-            (1, 'cannot be divided between'),
-            (0.05, 'cannot be divided between'),
-        ]
-        for bad, expected in cases:
-            tmp = mkdtemp()
-            try:
-                with self.assertRaises(ValueError) as ctx:
-                    self._run_trad(tmp, iterations=2, query_size=bad)
-                message = str(ctx.exception)
-                self.assertIn(expected, message)
-                # every message spells out both readings
-                self.assertIn('FRACTION', message)
-                self.assertIn('ABSOLUTE NUMBER', message)
-                self.assertIn('TOTAL pool', message)
-            finally:
-                rmtree(tmp)
+    def test_validate_max_query_size_per_fold(self):
+        '''Whole numbers only; 0 and blank mean no cap; fractions are refused.'''
+        for off in (None, 0, '', '  '):
+            self.assertIsNone(validate_max_query_size_per_fold(off))
+        self.assertEqual(validate_max_query_size_per_fold(3000), 3000)
+        for bad in (-1, 0.5, 2.0, '3000', True, False):
+            with self.assertRaises(ValueError) as ctx:
+                validate_max_query_size_per_fold(bad)
+            self.assertIn('max_query_size_per_fold', str(ctx.exception))
+        # refused before any dataset is generated
+        tmp = mkdtemp()
+        try:
+            with self.assertRaises(ValueError):
+                self._generate_capped(tmp, 0.2)
+            self.assertFalse(exists(ref_dbs_root(tmp)))
+        finally:
+            rmtree(tmp)
 
     def test_generate_simulated_datasets_novel_taxa_only(self):
         tmp = mkdtemp()

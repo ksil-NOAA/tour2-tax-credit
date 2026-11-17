@@ -24,10 +24,11 @@ from os.path import (
 from os import makedirs, remove, symlink, system, stat
 from glob import glob
 from itertools import product
-from shutil import rmtree, move
+from shutil import copyfile, rmtree, move
 from random import sample
 from time import time
 from collections import Counter, defaultdict
+from zlib import crc32
 
 import matplotlib.pyplot as plt
 from seaborn import regplot
@@ -59,6 +60,8 @@ from q2_types.feature_data import DNAIterator
 
 from tax_credit.paths import (
     QUERY_FASTA,
+    QUERY_FULL_FASTA,
+    QUERY_FULL_TAXA_TSV,
     QUERY_TAXA_TSV,
     REF_SEQS_FASTA,
     REF_TAXA_TSV,
@@ -370,7 +373,7 @@ def generate_simulated_datasets(dataframe, data_dir, iterations,
                                     'cross-validated-trad',
                                     'novel-taxa',
                                 ),
-                                trad_cv_query_size=None):
+                                max_query_size_per_fold=None):
     '''From a dataframe of sequence reference databases, build training/test
     sets of "novel taxa" queries, taxonomies, and reference seqs/taxonomies.
 
@@ -413,24 +416,27 @@ def generate_simulated_datasets(dataframe, data_dir, iterations,
         untrimmed test taxonomies), and ``novel-taxa``. Default runs all
         three. For backward compatibility, ``cross-validated`` is accepted as
         an alias of ``cross-validated-taxa``.
-    trad_cv_query_size : float, int, or None, optional
-        Size of the **total** ``cross-validated-trad`` query pool, divided
-        evenly between the ``iterations`` folds. A **float** in ``(0, 1]`` is
-        a **fraction** of the database; an **int** is an **absolute number of
-        sequences**. Both describe the total across all folds: with
-        ``trad_cv_query_size=0.2`` and ``iterations=8``, 20% of the database
-        is queried in total and each fold holds 2.5% of it. ``None``
-        (default) uses the whole database as the pool, so each fold holds
-        ``n_sequences / iterations`` sequences. An int larger than a given
-        database warns and falls back to that whole database, so one int can
-        be shared across databases of different sizes. Ignored unless
-        ``cross-validated-trad`` is in ``simulation_method``. See
-        :func:`generate_cross_validated_trad_sequences`.
+    max_query_size_per_fold : int or None, optional
+        Maximum number of query sequences scored in **each** fold of every
+        method built here (``cross-validated-taxa``, ``cross-validated-trad``
+        and ``novel-taxa``). Folds are first built as usual -- the database
+        split between ``iterations`` folds -- and any fold holding more
+        queries than this is then cut down to a random subset of this size,
+        drawn with a seed derived from the fold name so it is reproducible.
+        ``None`` or ``0`` (default) applies no cap. See
+        :func:`cap_fold_queries`.
+
+        Only the query set shrinks: reference files are never touched, and
+        queries left out are **not** returned to the reference. Novel-taxa
+        folds are derived from the full cross-validated folds and then capped
+        on their own. The uncapped query set is kept beside each capped fold
+        as ``query_full.fasta`` / ``query_full_taxa.tsv``.
 
         Fold contents are rewritten on every call, so a changed value takes
-        effect without ``force``; see
-        :func:`generate_cross_validated_trad_sequences`.
+        effect without ``force``.
     '''
+    max_query_size_per_fold = validate_max_query_size_per_fold(
+        max_query_size_per_fold)
     allowed_methods = {
         'cross-validated-taxa',
         'cross-validated-trad',
@@ -529,7 +535,7 @@ def generate_simulated_datasets(dataframe, data_dir, iterations,
         if make_cv_trad:
             generate_cross_validated_trad_sequences(
                 clean_taxa, simulated_reads_fp, index, iterations, cv_trad_dir,
-                force=force, query_size=trad_cv_query_size)
+                force=force)
 
         # Generate novel query and reference seqs/taxa pairs
         if make_novel:
@@ -543,6 +549,25 @@ def generate_simulated_datasets(dataframe, data_dir, iterations,
                 for fold_dir in glob(
                         join(cv_taxa_dir, format_cv_fold_dirname(index, '*'))):
                     rmtree(fold_dir)
+
+        # Cap query sets last: novel-taxa folds are derived from the FULL
+        # cross-validated folds above, so those must not be capped first. Every
+        # generator just rewrote its folds' query files, so each cap starts
+        # from a fresh, complete query set.
+        fold_dirs = []
+        if make_cv_taxa:
+            fold_dirs += [join(cv_dir, format_cv_fold_dirname(index, i))
+                          for i in range(iterations)]
+        if make_cv_trad:
+            fold_dirs += [join(cv_trad_dir, format_cv_fold_dirname(index, i))
+                          for i in range(iterations)]
+        if make_novel:
+            fold_dirs += [
+                join(novel_dir, format_novel_fold_dirname(index, level, i))
+                for level in levelrange for i in range(iterations)]
+        for fold_dir in fold_dirs:
+            if isfile(join(fold_dir, QUERY_TAXA_TSV)):
+                cap_fold_queries(fold_dir, max_query_size_per_fold)
 
     if make_novel and not make_cv_taxa and exists(novel_cv_tmp_dir):
         rmtree(novel_cv_tmp_dir)
@@ -913,81 +938,127 @@ def generate_cross_validated_sequences(read_taxa, simulated_reads_fp, index,
         artifact.save(ref_taxa_fp[:-3] + 'qza')
 
 
-_QUERY_SIZE_MEANING = (
-    'query_size is the TOTAL pool of query sequences, divided evenly between '
-    'the iterations. A float in (0, 1] means a FRACTION of the database (0.2 '
-    'means 20% of sequences in total, so 20%/iterations per fold); an int '
-    'means an ABSOLUTE NUMBER of sequences (10 means 10 sequences in total, '
-    'not 10% and not 10 per fold).')
+_MAX_QUERY_SIZE_MEANING = (
+    'max_query_size_per_fold is the most query sequences scored in EACH fold '
+    '(cross-validated, cross-validated-trad and novel-taxa), as a whole '
+    'number. 0 or blank means no cap: every fold keeps all of its queries.')
 
 
-def _resolve_query_pool_size(query_size, n_sequences, iterations, index):
-    '''Resolve a ``cross-validated-trad`` query pool size to a sequence count.
+def validate_max_query_size_per_fold(value):
+    '''Normalise a ``max_query_size_per_fold`` setting.
 
-    *query_size* is the total number of sequences queried across all folds:
-    a float in ``(0, 1]`` as a fraction of the database, or an int as an
-    absolute count. Returns that count as an int, or raises ``ValueError``
-    naming both readings, since ``0.2`` and ``20`` mean very different things.
-
-    An int larger than the database is **not** an error: a warning is printed
-    and the whole database is used, so one int can be shared across databases
-    of different sizes. The pool must still hold at least one sequence per
-    fold, so the resolved count is required to be >= *iterations*.
+    Returns ``None`` for no cap (``None``, ``0`` or an empty string) or the cap
+    as a positive int. Anything else -- a negative number, a float, a numeric
+    string, a bool -- raises ``ValueError``: a fraction is no longer accepted,
+    and silently reading ``0.2`` as "no cap" or ``'3000'`` as text would run a
+    very different benchmark from the one the config appears to request.
     '''
-    # bool is a subclass of int; reject it before the int branch accepts True.
-    if isinstance(query_size, bool):
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    # bool is a subclass of int; reject it before the int check accepts True.
+    if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError(
-            '{0}: query_size must be a float or an int, got bool {1!r}. '
-            '{2}'.format(index, query_size, _QUERY_SIZE_MEANING))
-    if isinstance(query_size, int):
-        n_pool = query_size
-        if n_pool < 1:
-            raise ValueError(
-                '{0}: query_size={1} sequences is out of range; an int '
-                'query_size must be at least 1. {2}'.format(
-                    index, query_size, _QUERY_SIZE_MEANING))
-        if n_pool > n_sequences:
-            # Asking for more sequences than the database holds is expected
-            # when one int is used to equalize query counts across databases
-            # of different sizes; fall back to the whole database.
-            print('WARNING: {0}: query_size={1} exceeds the {2} sequences in '
-                  'this database; querying the entire database ({2} sequences) '
-                  'instead. Query counts will not match databases large enough '
-                  'to supply {1} sequences.'.format(
-                      index, query_size, n_sequences))
-            n_pool = n_sequences
-    elif isinstance(query_size, float):
-        if not 0 < query_size <= 1:
-            hint = ''
-            if query_size > 1:
-                hint = (' To query {0:.0f} sequences in total, pass the int '
-                        '{0:.0f} instead.'.format(query_size))
-            raise ValueError(
-                '{0}: query_size={1} is out of range; a float query_size must '
-                'be greater than 0 and at most 1 (1.0 means the whole '
-                'database, which is the default). {2}{3}'.format(
-                    index, query_size, _QUERY_SIZE_MEANING, hint))
-        n_pool = round(query_size * n_sequences)
-    else:
+            'max_query_size_per_fold must be a whole number, got {0!r} of type '
+            '{1}. {2}'.format(value, type(value).__name__,
+                              _MAX_QUERY_SIZE_MEANING))
+    if value < 0:
         raise ValueError(
-            '{0}: query_size must be a float, an int, or None, got {1!r} of '
-            'type {2}. {3}'.format(
-                index, query_size, type(query_size).__name__,
-                _QUERY_SIZE_MEANING))
-    if n_pool < iterations:
-        # No point suggesting a bigger query_size once the pool is the whole
-        # database: the database itself is the limit.
-        fix = ('Reduce iterations to {0} or fewer.'.format(n_sequences)
-               if n_pool >= n_sequences
-               else 'Increase query_size or reduce iterations.')
-        raise ValueError(
-            '{0}: query_size={1} resolves to a total query pool of {2} '
-            'sequence(s) out of {3}, which cannot be divided between '
-            '{4} iterations (at least 1 sequence per fold is required). '
-            '{5} {6}'.format(
-                index, query_size, n_pool, n_sequences, iterations,
-                fix, _QUERY_SIZE_MEANING))
-    return n_pool
+            'max_query_size_per_fold must not be negative, got {0}. '
+            '{1}'.format(value, _MAX_QUERY_SIZE_MEANING))
+    return value or None
+
+
+def _fasta_records(fasta_fp):
+    '''Yield ``(id, record_text)`` for each record of a FASTA file.
+
+    The id is the header's first whitespace-delimited token, as scikit-bio
+    reads it. The record text is passed through untouched, so multi-line
+    records are copied exactly.
+    '''
+    sid, lines = None, []
+    with open(fasta_fp) as fasta:
+        for line in fasta:
+            if line.startswith('>'):
+                if sid is not None:
+                    yield sid, ''.join(lines)
+                sid, lines = line[1:].split(None, 1)[0], [line]
+            elif sid is not None:
+                lines.append(line)
+    if sid is not None:
+        yield sid, ''.join(lines)
+
+
+def cap_fold_queries(fold_dir, max_queries):
+    '''Cap the number of queries scored in one simulated fold.
+
+    *fold_dir* is a fold holding ``query.fasta``, ``query_taxa.tsv`` and
+    ``query.qza`` as just written by a fold generator. When *max_queries* is
+    set (see :func:`validate_max_query_size_per_fold`), the full query set is
+    copied to ``query_full.fasta`` / ``query_full_taxa.tsv``; then, if the fold
+    holds more than *max_queries* queries, the three query files are rewritten
+    to a random subset of that size. The subset is drawn without replacement,
+    with a seed derived from the fold's directory name, so a rerun picks the
+    same queries; queries keep their original order.
+
+    Reference files are never touched -- in ``cross-validated-trad`` and
+    ``self-validated`` they are symlinks to the shared database -- and queries
+    left out are not added to the reference. Returning them would hand the
+    classifier near relatives of the remaining queries, drifting scores toward
+    ``self-validated``.
+
+    With no cap, the fold is left as generated and any ``query_full_*`` files
+    left from an earlier capped run are removed, so they exist only while they
+    describe a capped fold.
+
+    Returns ``(n_queries, n_kept)``.
+    '''
+    max_queries = validate_max_query_size_per_fold(max_queries)
+    query_fp = join(fold_dir, QUERY_FASTA)
+    query_taxa_fp = join(fold_dir, QUERY_TAXA_TSV)
+    full_fp = join(fold_dir, QUERY_FULL_FASTA)
+    full_taxa_fp = join(fold_dir, QUERY_FULL_TAXA_TSV)
+
+    taxa_lines = [line for line in import_to_list(query_taxa_fp) if line]
+    n_queries = len(taxa_lines)
+    if max_queries is None:
+        for stale in (full_fp, full_taxa_fp):
+            if exists(stale):
+                remove(stale)
+        return n_queries, n_queries
+
+    copyfile(query_fp, full_fp)
+    copyfile(query_taxa_fp, full_taxa_fp)
+    if n_queries <= max_queries:
+        return n_queries, n_queries
+
+    seed = crc32(basename(fold_dir.rstrip('/')).encode('utf-8'))
+    keep_idx = sorted(random.RandomState(seed).choice(
+        n_queries, size=max_queries, replace=False))
+    kept_lines = [taxa_lines[i] for i in keep_idx]
+    keep_ids = {line.split('\t', 1)[0] for line in kept_lines}
+    export_list_to_file(kept_lines, query_taxa_fp)
+
+    written = set()
+    with open(query_fp, 'w') as out:
+        for sid, record in _fasta_records(full_fp):
+            if sid in keep_ids and sid not in written:
+                out.write(record)
+                written.add(sid)
+    missing = keep_ids - written
+    if missing:
+        raise RuntimeError(
+            '{0}: {1} of the sampled query ids are in {2} but not in {3} '
+            '(e.g. {4!r}); the fold\'s query files are out of step.'.format(
+                fold_dir, len(missing), QUERY_TAXA_TSV, QUERY_FASTA,
+                sorted(missing)[0]))
+
+    artifact = Artifact.import_data('FeatureData[Sequence]', query_fp)
+    artifact.save(query_fp[:-5] + 'qza')
+    print('{0}: scoring {1} of {2} queries (max_query_size_per_fold); the '
+          'full set is kept in {3}'.format(
+              basename(fold_dir.rstrip('/')), max_queries, n_queries,
+              QUERY_FULL_FASTA))
+    return n_queries, max_queries
 
 
 def _replace_symlink(link_path, target_path):
@@ -999,8 +1070,7 @@ def _replace_symlink(link_path, target_path):
 
 
 def generate_cross_validated_trad_sequences(read_taxa, simulated_reads_fp, index,
-                                            iterations, cv_dir, force=False,
-                                            query_size=None):
+                                            iterations, cv_dir, force=False):
     '''Cross-validation folds by random split of sequence IDs (traditional CV).
 
     For each fold, test sequences are drawn at random. Query FASTA and query
@@ -1021,44 +1091,21 @@ def generate_cross_validated_trad_sequences(read_taxa, simulated_reads_fp, index
     under the reference database directory (created once per database) to avoid
     duplicating QIIME artifacts across folds.
 
-    Parameters
-    ----------
-    query_size : float, int, or None, optional
-        Size of the **total query pool**, which is then divided evenly between
-        the ``iterations`` folds. A **float** in ``(0, 1]`` is a **fraction**
-        of the database; an **int** is an **absolute number of sequences**.
-        Both describe the total across all folds, not the size of one fold.
-
-        For example ``query_size=0.2`` with ``iterations=8`` queries 20% of
-        the database in total, so each fold holds 20%/8 = 2.5% of it.
-        Likewise ``query_size=8000`` with ``iterations=8`` gives 8 folds of
-        1000 sequences each.
-
-        ``None`` (default) uses the whole database as the pool, which is
-        equivalent to ``query_size=1.0``: each fold holds
-        ``n_sequences / iterations`` sequences.
-
-        An **int larger than this database** is not an error: a warning is
-        printed and the entire database is used as the pool. This lets one
-        int be shared across databases of different sizes, equalizing query
-        counts wherever the database is big enough to supply them.
-
-        In every case a random pool of the requested size is drawn (with a
-        fixed seed), then split with
-        ``KFold(n_splits=iterations, shuffle=True)``, so folds are disjoint
-        and together cover the pool exactly once. Folds differ by at most one
-        sequence when the pool does not divide evenly.
+    The whole database is split with
+    ``KFold(n_splits=iterations, shuffle=True)``, so folds are disjoint and
+    together cover the database exactly once, each holding about
+    ``n_sequences / iterations`` queries. To score fewer queries per fold, pass
+    ``max_query_size_per_fold`` to :func:`generate_simulated_datasets`, which
+    caps each fold afterwards (see :func:`cap_fold_queries`).
 
     Notes
     -----
     Every fold's ``query.fasta`` and ``query_taxa.tsv`` are rewritten on each
-    call, so a changed *query_size* takes effect without any cache flag.
-    ``force`` here only deletes the shared ``_trad_cv_shared_ref_*.qza``
-    artifacts, which hold the full-database reference and do not depend on
-    *query_size*. (Under Tourmaline the catch is one level up: snakemake skips
-    ``tax_credit_prepare_datasets`` on a finished run, so delete
-    ``.datasets.done`` or use ``--forcerun`` to make this function run at all.
-    ``force_regenerate`` does not trigger it.)
+    call. ``force`` here only deletes the shared ``_trad_cv_shared_ref_*.qza``
+    artifacts, which hold the full-database reference. (Under Tourmaline,
+    snakemake skips ``tax_credit_prepare_datasets`` on a finished run, so
+    delete ``.datasets.done`` or use ``--forcerun`` to make this function run
+    at all. ``force_regenerate`` does not trigger it.)
     '''
     if iterations < 2:
         raise ValueError('Must perform two or more iterations for '
@@ -1079,26 +1126,12 @@ def generate_cross_validated_trad_sequences(read_taxa, simulated_reads_fp, index
         view_type='HeaderlessTSVTaxonomyFormat')
     taxonomy_series = taxonomy.view(pd.Series)
 
-    # The query pool is what gets divided between the folds. By default it is
-    # the whole database; query_size shrinks it to a random subset first.
-    if query_size is None:
-        pool_ids = seq_ids
-        print('{0}: dividing all {1} sequences between {2} folds '
-              '(~{3} query sequences per fold)'.format(
-                  index, len(seq_ids), iterations, len(seq_ids) // iterations))
-    else:
-        n_pool = _resolve_query_pool_size(
-            query_size, len(seq_ids), iterations, index)
-        # Fixed seed so the pool is reproducible across runs.
-        pool_idx = random.RandomState(0).permutation(len(seq_ids))[:n_pool]
-        pool_ids = [seq_ids[i] for i in sorted(pool_idx)]
-        print('{0}: query_size={1!r} -> dividing a random pool of {2} of {3} '
-              'sequences ({4:.2%} of the database) between {5} folds '
-              '(~{6} query sequences per fold, ~{7:.2%} of the database '
-              'each)'.format(
-                  index, query_size, n_pool, len(seq_ids),
-                  n_pool / len(seq_ids), iterations, n_pool // iterations,
-                  (n_pool / iterations) / len(seq_ids)))
+    # The whole database is divided between the folds. Per-fold query caps
+    # (max_query_size_per_fold) are applied afterwards by cap_fold_queries.
+    pool_ids = seq_ids
+    print('{0}: dividing all {1} sequences between {2} folds '
+          '(~{3} query sequences per fold)'.format(
+              index, len(seq_ids), iterations, len(seq_ids) // iterations))
 
     ref_reads_abs = abspath(simulated_reads_fp)
     ref_taxa_abs = abspath(read_taxa)
