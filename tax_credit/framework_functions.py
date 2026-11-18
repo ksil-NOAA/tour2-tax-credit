@@ -75,6 +75,7 @@ from tax_credit.simulation_names import (
     cross_validated_trad_root,
     format_cv_fold_dirname,
     format_novel_fold_dirname,
+    novel_level_rank,
     novel_taxa_simulations_root,
     parse_cv_dataset_id,
     parse_novel_dataset_id,
@@ -373,7 +374,8 @@ def generate_simulated_datasets(dataframe, data_dir, iterations,
                                     'cross-validated-trad',
                                     'novel-taxa',
                                 ),
-                                max_query_size_per_fold=None):
+                                max_query_size_per_fold=None,
+                                rank_positions=None, rank_names=None):
     '''From a dataframe of sequence reference databases, build training/test
     sets of "novel taxa" queries, taxonomies, and reference seqs/taxonomies.
 
@@ -434,6 +436,17 @@ def generate_simulated_datasets(dataframe, data_dir, iterations,
 
         Fold contents are rewritten on every call, so a changed value takes
         effect without ``force``.
+    rank_positions : list of int or None, optional
+        Position of each of the seven scored ranks in the taxonomy, for a
+        database whose taxonomy is not the standard seven ranks (the same
+        positions ``load_prf`` scores). Novel-taxa levels in *levelrange* are
+        then held out at those positions (see ``generate_novel_sequence_sets``).
+        Call this once per database when databases differ. ``None`` (default)
+        keeps the standard seven.
+    rank_names : sequence of str or None, optional
+        Names of the seven scored ranks; a level's name labels its novel-taxa
+        folds (``<db>-species-iter0`` for level 6). ``None`` (default) uses
+        ``simulation_names.DEFAULT_RANK_NAMES``.
     '''
     max_query_size_per_fold = validate_max_query_size_per_fold(
         max_query_size_per_fold)
@@ -543,7 +556,8 @@ def generate_simulated_datasets(dataframe, data_dir, iterations,
             # an unscoped glob would rebuild the earlier databases' novel folds
             # again and would read any half-written fold left in cv_taxa_dir.
             generate_novel_sequence_sets(
-                cv_taxa_dir, novel_dir, levelrange=levelrange, index=index)
+                cv_taxa_dir, novel_dir, levelrange=levelrange, index=index,
+                rank_positions=rank_positions, rank_names=rank_names)
             # If cv-taxa output wasn't requested, discard temporary folds.
             if not make_cv_taxa:
                 for fold_dir in glob(
@@ -563,7 +577,8 @@ def generate_simulated_datasets(dataframe, data_dir, iterations,
                           for i in range(iterations)]
         if make_novel:
             fold_dirs += [
-                join(novel_dir, format_novel_fold_dirname(index, level, i))
+                join(novel_dir,
+                     format_novel_fold_dirname(index, level, i, rank_names))
                 for level in levelrange for i in range(iterations)]
         for fold_dir in fold_dirs:
             if isfile(join(fold_dir, QUERY_TAXA_TSV)):
@@ -687,8 +702,34 @@ def generate_self_validated_datasets(dataframe, data_dir, read_length=None,
             artifact.save(query_fp[:-5] + 'qza')
 
 
+def novel_rank_position(level, rank_positions=None):
+    '''Taxonomy position at which novel-taxa level *level* is held out.
+
+    *level* counts the seven scored ranks (1 = phylum ... 6 = species); novel
+    fold names carry that rank's name (``<db>-species-iter0`` = novel species).
+    *rank_positions* gives the position of each scored rank in this database's
+    taxonomy (see ``load_prf``); ``None`` means the standard seven, where level
+    and position coincide. For a nine-rank taxonomy with species at position 8,
+    level 6 is held out at position 8, not at the family in position 6.
+    '''
+    level = int(level)
+    if not 1 <= level <= 6:
+        raise ValueError(
+            'novel-taxa levels run from 1 (phylum) to 6 (species); '
+            'got {0}'.format(level))
+    if rank_positions is None:
+        return level
+    positions = [int(p) for p in rank_positions]
+    if len(positions) != 7 or positions != sorted(set(positions)) or positions[0] < 0:
+        raise ValueError(
+            'rank_positions must be seven increasing taxonomy positions; '
+            'got {0}'.format(rank_positions))
+    return positions[level]
+
+
 def generate_novel_sequence_sets(cv_dir, novel_dir,
-                                 levelrange=range(6, 0, -1), index=None):
+                                 levelrange=range(6, 0, -1), index=None,
+                                 rank_positions=None, rank_names=None):
     '''Generate paired query/reference fastas and taxonomies for novel taxa
     analysis, given an input of simulated amplicon taxonomies (read_taxa)
     and fastas (simulated_reads_fp), the index (database) name, # of
@@ -706,7 +747,25 @@ def generate_novel_sequence_sets(cv_dir, novel_dir,
         databases' folds and, worse, trips over a half-written fold left in
         ``cv_dir`` by a previous failed run (one with ``ref_taxa.tsv`` but no
         ``query_taxa.tsv`` yet).
+    rank_positions: list of int or None
+        Position of each of the seven scored ranks in this database's taxonomy,
+        for a taxonomy that is not the standard seven (see ``load_prf``). Each
+        level in *levelrange* is then held out at its rank's position
+        (``novel_rank_position``), and the expected taxonomy is cut to the
+        position just above it, which may be an unscored rank (for PR2, a novel
+        class leaves the subdivision as the deepest known rank). ``None`` keeps
+        the standard seven.
+    rank_names: sequence of str or None
+        Names of the seven scored ranks (default
+        ``simulation_names.DEFAULT_RANK_NAMES``). Each fold is named after its
+        held-out rank, ``<db>-<rank>-iter<n>`` (``<db>-species-iter0``), so a
+        fold's name means the same rank in every database whatever its
+        position there.
     '''
+    from tax_credit.paths import NOVEL_FOLD_INFO_TSV
+    positions_label = ','.join(
+        str(p) for p in (rank_positions if rank_positions is not None
+                         else range(7)))
 
     fold_pattern = '*' if index is None else format_cv_fold_dirname(index, '*')
     for cv_fold_dir in sorted(glob(join(cv_dir, fold_pattern))):
@@ -723,13 +782,18 @@ def generate_novel_sequence_sets(cv_dir, novel_dir,
         for level in levelrange:
             novel_fold_dir = join(
                 novel_dir,
-                format_novel_fold_dirname(fold_db, level, int(iteration)))
+                format_novel_fold_dirname(fold_db, level, int(iteration),
+                                          rank_names))
             if not exists(novel_fold_dir):
                 makedirs(novel_fold_dir)
 
-            # Trim taxonomy strings to level X and copy them into the directory
+            # Position of the held-out rank in this database's taxonomy; equal
+            # to the level for the standard seven ranks.
+            position = novel_rank_position(level, rank_positions)
+
+            # Trim taxonomy strings to that rank and copy them into the directory
             query_taxa = trim_taxonomy_strings(
-                join(cv_fold_dir, QUERY_TAXA_TSV), level)
+                join(cv_fold_dir, QUERY_TAXA_TSV), position)
             query_taxa_fp = join(novel_fold_dir, QUERY_TAXA_TSV)
             export_list_to_file(query_taxa, query_taxa_fp)
 
@@ -737,15 +801,15 @@ def generate_novel_sequence_sets(cv_dir, novel_dir,
             #    DO NOT match QUERY taxonomies
             ref_taxa_fp = join(novel_fold_dir, REF_TAXA_TSV)
             name_list = '^' + '$|^'.join(list(set(extract_taxa_names(
-                query_taxa_fp, slice(1, level+1), stripchars='')))) + '$'
+                query_taxa_fp, slice(1, position+1), stripchars='')))) + '$'
             ref_taxa = string_search(join(cv_fold_dir, REF_TAXA_TSV),
                                      name_list, discard=True,
-                                     field=slice(1, level+1))
+                                     field=slice(1, position+1))
             export_list_to_file(ref_taxa, ref_taxa_fp)
 
-            # Now trim the taxonomy strings to level X-1 for consistency with
-            # CV and remove any that are unclassified at that level
-            query_taxa = trim_taxonomy_strings(query_taxa_fp, level-1)
+            # Now trim the taxonomy strings to the rank above for consistency
+            # with CV and remove any that are unclassified at that level
+            query_taxa = trim_taxonomy_strings(query_taxa_fp, position-1)
             separated = defaultdict(list)
             for s in query_taxa:
                 separated[s.count(';')].append(s)
@@ -775,6 +839,12 @@ def generate_novel_sequence_sets(cv_dir, novel_dir,
                             n_dropped))
                 print(message)
             export_list_to_file(truncated, query_taxa_fp)
+            export_list_to_file(
+                ['level\t{0}'.format(level),
+                 'rank\t{0}'.format(novel_level_rank(level, rank_names)),
+                 'rank_position\t{0}'.format(position),
+                 'rank_positions\t{0}'.format(positions_label)],
+                join(novel_fold_dir, NOVEL_FOLD_INFO_TSV))
 
             # Create REF: Filter ref database to contain only seqs that
             #    match non-matching taxonomy strings
@@ -1212,7 +1282,8 @@ def test_novel_taxa_datasets(data_dir):
 
 def recall_simulated_taxa_dirs(data_dir, databases, iterations,
                                ref_seqs=REF_SEQS_FASTA, ref_taxa=REF_TAXA_TSV,
-                               max_level=6, min_level=0, multilevel=True):
+                               max_level=6, min_level=0, multilevel=True,
+                               rank_names=None):
     '''Build sweep inputs for simulated reference datasets (novel-taxa or CV).
 
     Returns a list of ``(dataset_id, reference_id)`` pairs (here both the same
@@ -1232,13 +1303,17 @@ def recall_simulated_taxa_dirs(data_dir, databases, iterations,
         Basenames of reference sequence and taxonomy files in each fold
         (defaults: ``ref_seqs.fasta``, ``ref_taxa.tsv``).
     max_level, min_level : int
-        For ``multilevel=True``, level range for novel-taxa fold names
-        ``<db>-L<level>-iter<i>`` (e.g. ``max_level=6``, ``min_level=0`` yields
-        levels 6..1). Ignored when ``multilevel=False``.
+        For ``multilevel=True``, level range for novel-taxa folds (e.g.
+        ``max_level=6``, ``min_level=0`` yields levels 6..1). Each level is
+        named by its rank, ``<db>-<rank>-iter<i>``. Ignored when
+        ``multilevel=False``.
     multilevel : bool
         If ``True``, use novel-taxa fold naming. If ``False``, use cross-validated
         fold naming ``<db>-iter<i>`` (still one level slot in the loop; set
         ``max_level`` / ``min_level`` to span a single level when needed).
+    rank_names : sequence of str or None
+        Names of the seven scored ranks used in novel-taxa fold names (default
+        ``simulation_names.DEFAULT_RANK_NAMES``).
 
     Returns
     -------
@@ -1252,9 +1327,8 @@ def recall_simulated_taxa_dirs(data_dir, databases, iterations,
         for level in range(max_level, min_level, -1):
             for iteration in range(0, iterations):
                 if multilevel is True:
-                    dataset_name = format_novel_fold_dirname(database,
-                                                             level,
-                                                             iteration)
+                    dataset_name = format_novel_fold_dirname(
+                        database, level, iteration, rank_names)
                 else:
                     dataset_name = format_cv_fold_dirname(database, iteration)
                 dataset_reference_combinations.append((dataset_name,

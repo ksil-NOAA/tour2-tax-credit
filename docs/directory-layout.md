@@ -42,7 +42,7 @@ Under the data directory, simulation roots use names exposed in `simulation_name
 |----------|--------|----------|
 | `DIR_CROSS_VALIDATED` | `cross-validated/` | **`cross-validated-taxa`** folds — stratified CV; per-fold `ref_seqs.fasta` / `ref_taxa.tsv` exclude query IDs. |
 | `DIR_CROSS_VALIDATED_TRAD` | `cross-validated-trad/` | **`cross-validated-trad`** folds — random KFold; `query.fasta` / `query_taxa.tsv` are the test split only; `ref_seqs.fasta` and `ref_taxa.tsv` are **symlinks** to the full simulated-reads FASTA and cleaned taxonomy under `ref_dbs/`. |
-| `DIR_NOVEL_TAXA_SIMULATIONS` | `novel-taxa-simulations/` | **Novel-taxa** derived datasets (from CV-taxa folds). |
+| `DIR_NOVEL_TAXA_SIMULATIONS` | `novel-taxa-simulations/` | **Novel-taxa** derived datasets (from CV-taxa folds). Folds are named by held-out rank, `<db>-<rank>-iter<n>` (`<db>-species-iter0`). Each fold also holds `novel_fold_info.tsv` (level, rank, held-out position, rank positions). |
 | `DIR_SELF_VALIDATED` | `self-validated/` | **Self-validated** datasets — one directory per reference database; query and reference both contain every sequence (no CV folds). |
 | `DIR_REF_DBS` | `ref_dbs/` | Per–reference-id cleaned FASTA, taxonomy, extracted simulated reads, and (for trad) shared QIIME artifacts: `_trad_cv_shared_ref_seqs.qza`, `_trad_cv_shared_ref_taxa.qza`. |
 
@@ -51,7 +51,7 @@ Under the data directory, simulation roots use names exposed in `simulation_name
 Fold directory names are generated and parsed with helpers such as:
 
 - `format_cv_fold_dirname` / `parse_cv_dataset_id` — e.g. `<db>-iter<n>` (used for both `cross-validated` and `cross-validated-trad` trees)
-- `format_novel_fold_dirname` / `parse_novel_dataset_id` — e.g. `<db>-L<level>-iter<n>` (supports hyphenated database IDs like `B1-REF`)
+- `format_novel_fold_dirname(db, level, n, rank_names=None)` / `parse_novel_dataset_id(id, rank_names=None)` — `<db>-<rank>-iter<n>`, where `<rank>` is `rank_names[level]` (default `DEFAULT_RANK_NAMES`, so level 6 is `species`). Supports hyphenated database IDs like `B1-REF`; rank names may hold only letters, digits, `_` and `.`. Old level-numbered names (`<db>-L6-iter0`) are rejected with a note to regenerate.
 
 Path roots: `cross_validated_root`, `cross_validated_trad_root`, `novel_taxa_simulations_root`, `ref_dbs_root` in `simulation_names.py`.
 

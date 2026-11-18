@@ -56,6 +56,10 @@ REF_TAXA_TSV = "ref_taxa.tsv"
 # Only present while a cap is in effect; the capped files keep the names above.
 QUERY_FULL_FASTA = "query_full.fasta"
 QUERY_FULL_TAXA_TSV = "query_full_taxa.tsv"
+# Novel-taxa folds only: the level, the taxonomy position it was held out at,
+# and the database's scored rank positions, so a fold built for a different
+# rank layout can be detected rather than silently scored.
+NOVEL_FOLD_INFO_TSV = "novel_fold_info.tsv"
 
 
 class MockResultTableParts(NamedTuple):

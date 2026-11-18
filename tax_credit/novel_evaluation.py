@@ -69,7 +69,7 @@ def write_classification_metrics(per_level, meta, metrics_fp):
         a list of seven values indexed by taxonomic level.
     meta: dict
         Identifying columns written on every row, e.g. ``Dataset``,
-        ``novel_level``, ``iteration``, ``Method``, ``Parameters``.
+        ``novel_level``, ``novel_rank``, ``iteration``, ``Method``, ``Parameters``.
     metrics_fp: path
         Output file.
 
@@ -96,7 +96,7 @@ def write_classification_metrics(per_level, meta, metrics_fp):
 
 def novel_taxa_classification_evaluation(results_dirs, expected_results_dir,
                                          summary_fp, test_type='novel-taxa',
-                                         rank_positions=None):
+                                         rank_positions=None, rank_names=None):
     '''Input glob of novel taxa results, receive a summary of accuracy results.
     results_dirs = list or glob of novel taxa observed results in format:
                     precomputed_results_dir/dataset_id/method_id/params_id/
@@ -113,6 +113,10 @@ def novel_taxa_classification_evaluation(results_dirs, expected_results_dir,
         positions to score, for databases whose taxonomy is not the standard
         seven ranks (see ``framework_functions.load_prf``). Databases not
         listed keep the first seven ranks.
+    rank_names = names of the seven scored ranks, used to read the held-out
+        rank from novel-taxa fold names (``<db>-species-iter0``). Default
+        ``simulation_names.DEFAULT_RANK_NAMES``; pass the names the folds were
+        generated with.
 
     Returns results as df, in addition to printing summary_fp.
 
@@ -137,20 +141,21 @@ def novel_taxa_classification_evaluation(results_dirs, expected_results_dir,
         dataset_id, method_id, params_id = res_parts
 
         if test_type == 'novel-taxa':
-            novel_parts = parse_novel_dataset_id(dataset_id)
+            novel_parts = parse_novel_dataset_id(dataset_id, rank_names)
             index, level, iteration = (
                 novel_parts.database,
                 novel_parts.level,
                 novel_parts.iteration,
             )
+            novel_rank = novel_parts.rank
         elif test_type in ('cross-validated', 'cross-validated-trad'):
             cv_parts = parse_cv_dataset_id(dataset_id)
             index, iteration = cv_parts.database, cv_parts.iteration
-            level = 6
+            level, novel_rank = 6, None
         elif test_type == 'self-validated':
             sv_parts = parse_self_validated_dataset_id(dataset_id)
             index, iteration = sv_parts.database, sv_parts.iteration
-            level = 6
+            level, novel_rank = 6, None
         else:
             raise ValueError(
                 'test_type must be "novel-taxa", "cross-validated", '
@@ -197,6 +202,7 @@ def novel_taxa_classification_evaluation(results_dirs, expected_results_dir,
             {
                 "Dataset": index,
                 "novel_level": level if test_type == 'novel-taxa' else None,
+                "novel_rank": novel_rank,
                 "iteration": iteration,
                 "Method": method_id,
                 "Parameters": params_id,
@@ -285,23 +291,27 @@ def _truncate_taxonomy_at_level(taxon, level):
     return normalize_taxon(";".join(taxon.split(";")[:level + 1]))
 
 
-def _dataset_parts_from_dataset_id(dataset_id):
-    """Return ``(database, novel_level, iteration)`` for an assignment dataset id.
+def _dataset_parts_from_dataset_id(dataset_id, rank_names=None):
+    """Return ``(database, novel_level, novel_rank, iteration)`` for a dataset id.
 
-    ``novel_level`` is ``None`` for cross-validated and self-validated ids.
+    ``novel_level`` and ``novel_rank`` are ``None`` for cross-validated and
+    self-validated ids. A novel-taxa id is recognised by its rank segment
+    (``<db>-<rank>-iter<n>`` with a rank among *rank_names*), so a
+    cross-validated database whose own id ends in ``-<rank name>`` would be
+    misread; database ids should not end that way.
     """
     try:
-        parts = parse_novel_dataset_id(dataset_id)
-        return parts.database, parts.level, str(parts.iteration)
+        parts = parse_novel_dataset_id(dataset_id, rank_names)
+        return parts.database, parts.level, parts.rank, str(parts.iteration)
     except (ValueError, TypeError):
         pass
     for parser in (parse_cv_dataset_id, parse_self_validated_dataset_id):
         try:
             parts = parser(dataset_id)
-            return parts.database, None, str(parts.iteration)
+            return parts.database, None, None, str(parts.iteration)
         except (ValueError, TypeError):
             continue
-    return dataset_id.split("-", 1)[0], None, "0"
+    return dataset_id.split("-", 1)[0], None, None, "0"
 
 
 def per_level_classification_ratios_from_log(log_fp):
@@ -370,14 +380,16 @@ def _per_level_rows(results_dir):
     return None
 
 
-def extract_per_level_classification_ratios_by_fold(results_dirs):
+def extract_per_level_classification_ratios_by_fold(results_dirs,
+                                                    rank_names=None):
     """Per-level classification ratios, one row per result directory and level.
 
     Reads ``classification_metrics.tsv`` from each assignment result
     directory, falling back to recomputing from
     ``classification_accuracy_log.tsv`` for results written before the sidecar
     existed. Columns: ``Dataset``, ``novel_level`` (novel-taxa simulation
-    level, ``<NA>`` otherwise), ``iteration``, ``Method``, ``Parameters``,
+    level, ``<NA>`` otherwise), ``novel_rank`` (the held-out rank's name, read
+    from the fold name with *rank_names*), ``iteration``, ``Method``, ``Parameters``,
     ``level`` and ``CLASSIFICATION_METRIC_COLS``.
     """
     rows = []
@@ -386,11 +398,13 @@ def extract_per_level_classification_ratios_by_fold(results_dirs):
         if level_rows is None:
             continue
         dataset_id, method_id, params_id = parse_assignment_results_dir(results_dir)
-        database, novel_level, iteration = _dataset_parts_from_dataset_id(dataset_id)
+        database, novel_level, novel_rank, iteration = (
+            _dataset_parts_from_dataset_id(dataset_id, rank_names))
         for level_row in level_rows:
             rows.append({
                 "Dataset": database,
                 "novel_level": novel_level,
+                "novel_rank": novel_rank,
                 "iteration": iteration,
                 "Method": method_id,
                 "Parameters": params_id,
@@ -405,17 +419,19 @@ def extract_per_level_classification_ratios_by_fold(results_dirs):
     return df
 
 
-def extract_per_level_classification_ratios(results_dirs):
+def extract_per_level_classification_ratios(results_dirs, rank_names=None):
     """Per-level classification metrics averaged across iterations.
 
     Groups by Dataset, novel_level, Method, Parameters and level, so novel-taxa
     simulations at different novel levels are never averaged together.
     """
-    df = extract_per_level_classification_ratios_by_fold(results_dirs)
+    df = extract_per_level_classification_ratios_by_fold(results_dirs,
+                                                         rank_names)
     if df.empty:
         return df
     return df.groupby(
-        ["Dataset", "novel_level", "Method", "Parameters", "level"],
+        ["Dataset", "novel_level", "novel_rank", "Method", "Parameters",
+         "level"],
         as_index=False,
         dropna=False,
     )[[column for column in CLASSIFICATION_METRIC_COLS

@@ -55,9 +55,9 @@ class PathsTests(TestCase):
         self.assertEqual(p.reference_id, "greengenes")
 
     def test_parse_assignment_results_dir(self):
-        fp = "/out/silva-L3-iter0/naive-bayes/p1"
+        fp = "/out/silva-order-iter0/naive-bayes/p1"
         p = parse_assignment_results_dir(fp)
-        self.assertEqual(p.dataset_id, "silva-L3-iter0")
+        self.assertEqual(p.dataset_id, "silva-order-iter0")
         self.assertEqual(p.method_id, "naive-bayes")
         self.assertEqual(p.params_id, "p1")
 

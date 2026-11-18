@@ -32,6 +32,8 @@ Simulations split a reference database into **query** (test) and **reference** (
 
 **Per-fold query cap.** `max_query_size_per_fold` (Tourmaline: same key), an int, caps the number of queries scored in **each** fold of `cross-validated-taxa`, `cross-validated-trad` and `novel-taxa`. `None` or `0` means no cap. Folds are built as usual, then any fold above the cap is cut down to a reproducible random subset. References are untouched, and novel-taxa folds are built from the full cross-validated folds before capping. The uncapped query set is kept as `query_full.fasta` / `query_full_taxa.tsv`. `self-validated` is never capped. See [python-api.md](python-api.md#max_query_size_per_fold-per-fold-query-cap).
 
+**Taxonomies other than the standard seven ranks.** `rank_positions` (the seven scored ranks' positions in the taxonomy) makes novel-taxa levels hold out the named rank — level 6 is novel species at the species position — rather than a raw position. Novel folds are named by that rank (`<db>-species-iter0`), so a fold name means the same rank in every database. See [python-api.md](python-api.md#rank_positions-novel-taxa-on-taxonomies-other-than-the-standard-seven).
+
 The legacy alias **`cross-validated`** means **`cross-validated-taxa`**.
 
 ### Novel-taxa simulations

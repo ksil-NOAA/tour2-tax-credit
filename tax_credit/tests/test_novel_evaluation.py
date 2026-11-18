@@ -170,17 +170,17 @@ class NovelEvaluationModuleTests(unittest.TestCase):
         header = ["dataset", "level", "iteration", "method", "parameters",
                   "observed_taxonomy", "expected_taxonomy", "result",
                   "mismatch_level"]
-        # L5 read matches; L6 read is misclassified at class
+        # novel genus read matches; novel species read is misclassified at class
         logs = {
-            "db1-L5-iter0": ("A;B;C;D;E", "A;B;C;D;E", "match", "5"),
-            "db1-L6-iter0": ("A;B;X;D;E;F", "A;B;C;D;E;F", "misclassification", "2"),
+            "db1-genus-iter0": ("5", "A;B;C;D;E", "A;B;C;D;E", "match", "5"),
+            "db1-species-iter0": ("6", "A;B;X;D;E;F", "A;B;C;D;E;F", "misclassification", "2"),
         }
         with TemporaryDirectory() as tmp:
             dirs = []
-            for dataset_id, (obs, exp, result, mismatch) in logs.items():
+            for dataset_id, (level, obs, exp, result, mismatch) in logs.items():
                 results_dir = join(tmp, dataset_id, "method1", "param1")
                 makedirs(results_dir)
-                row = ["db1", dataset_id[5], "0", "method1", "param1",
+                row = ["db1", level, "0", "method1", "param1",
                        obs, exp, result, mismatch]
                 with open(join(results_dir, "classification_accuracy_log.tsv"), "w") as f:
                     f.write("\t".join(header) + "\n" + "\t".join(row) + "\n")
@@ -191,6 +191,7 @@ class NovelEvaluationModuleTests(unittest.TestCase):
 
         self.assertEqual(set(by_fold["iteration"]), {"0"})
         self.assertEqual(sorted(averaged["novel_level"].unique()), [5, 6])
+        self.assertEqual(set(averaged["novel_rank"]), {"genus", "species"})
         class_level = averaged[averaged["level"] == 2].set_index("novel_level")
         self.assertEqual(class_level.loc[5, "match_ratio"], 1.0)
         self.assertEqual(class_level.loc[6, "misclassification_ratio"], 1.0)

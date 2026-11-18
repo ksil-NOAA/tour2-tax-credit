@@ -26,6 +26,7 @@ from tax_credit.framework_functions import (
     validate_max_query_size_per_fold,
     generate_novel_sequence_sets,
     generate_simulated_datasets,
+    novel_rank_position,
     clean_database,
     evaluate_classification,
     find_last_common_ancestor,
@@ -35,6 +36,7 @@ from tax_credit.framework_functions import (
     simulated_reads_filepath,
 )
 from tax_credit.paths import (
+    NOVEL_FOLD_INFO_TSV,
     QUERY_FASTA,
     QUERY_FULL_FASTA,
     QUERY_FULL_TAXA_TSV,
@@ -109,9 +111,9 @@ class EvalFrameworkTests(TestCase):
             self.assertEqual(set(query_ids).intersection(set(ref_ids)), set())
             # test that novel-taxa queries have no match in ref
             query_taxa = import_taxonomy_to_dict(
-                join(self.ntdir, 'B1-REF-L6-iter{0}'.format(i), QUERY_TAXA_TSV))
+                join(self.ntdir, 'B1-REF-species-iter{0}'.format(i), QUERY_TAXA_TSV))
             ref_taxa = import_taxonomy_to_dict(
-                join(self.ntdir, 'B1-REF-L6-iter{0}/ref_taxa.tsv'.format(i)))
+                join(self.ntdir, 'B1-REF-species-iter{0}/ref_taxa.tsv'.format(i)))
             for key, value in query_taxa.items():
                 self.assertNotIn(key, ref_taxa)
                 self.assertNotIn(value, ref_taxa.values())
@@ -123,7 +125,7 @@ class EvalFrameworkTests(TestCase):
         tmp = mkdtemp()
         try:
             copy(join(self.tmpdir, 'ref1.txt'), join(tmp, 'ref1.txt'))
-            name = 'B1-REF-L6-iter0'
+            name = 'B1-REF-species-iter0'
             qdir = join(tmp, name)
             makedirs(qdir)
             copy(self.query_fp, join(qdir, QUERY_TAXA_TSV))
@@ -162,7 +164,7 @@ class EvalFrameworkTests(TestCase):
         tmp = mkdtemp()
         try:
             copy(join(self.tmpdir, 'ref1.txt'), join(tmp, 'ref1.txt'))
-            name = 'B1-REF-L6-iter0'
+            name = 'B1-REF-species-iter0'
             qdir = join(tmp, name)
             makedirs(qdir)
             copy(self.query_fp, join(qdir, QUERY_TAXA_TSV))
@@ -202,7 +204,7 @@ class EvalFrameworkTests(TestCase):
         tmp = mkdtemp()
         try:
             copy(join(self.tmpdir, 'ref1.txt'), join(tmp, 'ref1.txt'))
-            name = 'B1-REF-L6-iter0'
+            name = 'B1-REF-species-iter0'
             qdir = join(tmp, name)
             makedirs(qdir)
             copy(self.query_fp, join(qdir, QUERY_TAXA_TSV))
@@ -248,7 +250,7 @@ class EvalFrameworkTests(TestCase):
         tmp = mkdtemp()
         try:
             copy(join(self.tmpdir, 'ref1.txt'), join(tmp, 'ref1.txt'))
-            name = 'B1-REF-L6-iter0'
+            name = 'B1-REF-species-iter0'
             qdir = join(tmp, name)
             makedirs(qdir)
             copy(self.query_fp, join(qdir, QUERY_TAXA_TSV))
@@ -291,7 +293,7 @@ class EvalFrameworkTests(TestCase):
         tmp = mkdtemp()
         try:
             copy(join(self.tmpdir, 'ref1.txt'), join(tmp, 'ref1.txt'))
-            name = 'B1-REF-L6-iter0'
+            name = 'B1-REF-species-iter0'
             qdir = join(tmp, name)
             makedirs(qdir)
             copy(self.query_fp, join(qdir, QUERY_TAXA_TSV))
@@ -484,7 +486,7 @@ class EvalFrameworkTests(TestCase):
             ntdir = novel_taxa_simulations_root(tmp)
             for i in range(2):
                 self.assertTrue(exists(
-                    join(ntdir, 'B1-REF-L6-iter{0}'.format(i))))
+                    join(ntdir, 'B1-REF-species-iter{0}'.format(i))))
             # ...and nothing was built for the stale database.
             self.assertEqual(glob(join(ntdir, 'otherdb*')), [])
             # Scoping means the stale fold is never even looked at, so no
@@ -492,6 +494,91 @@ class EvalFrameworkTests(TestCase):
             self.assertTrue(exists(join(stale, REF_TAXA_TSV)))
         finally:
             rmtree(tmp)
+
+    def _nine_rank_cv_fold(self, root):
+        '''One cross-validated fold of a nine-rank taxonomy (D;K;P;Sp;C;O;F;G;S).'''
+        fold = join(cross_validated_root(root), 'nine-iter0')
+        makedirs(fold)
+        ref = {
+            'r1': 'D;K;P;Sp;C;O;F1;G1;S1',
+            'r2': 'D;K;P;Sp;C;O;F1;G1;S2',
+            'r3': 'D;K;P;Sp;C;O;F1;G2;S3',
+            'r4': 'D;K;P;Sp;C;O;F2;G3;S4',
+        }
+        query = {'q1': 'D;K;P;Sp;C;O;F1;G1;S1'}
+        for taxa, seqs_name, taxa_name in ((ref, REF_SEQS_FASTA, REF_TAXA_TSV),
+                                           (query, QUERY_FASTA, QUERY_TAXA_TSV)):
+            with open(join(fold, taxa_name), 'w') as out:
+                out.write(''.join(f'{k}\t{v}\n' for k, v in taxa.items()))
+            with open(join(fold, seqs_name), 'w') as out:
+                out.write(''.join(f'>{k}\nACGTACGTAC\n' for k in taxa))
+        return fold
+
+    def _novel_fold(self, root, level, rank_positions):
+        buf = StringIO()
+        with redirect_stdout(buf):
+            generate_novel_sequence_sets(
+                cross_validated_root(root), novel_taxa_simulations_root(root),
+                levelrange=[level], index='nine', rank_positions=rank_positions)
+        rank = ('kingdom', 'phylum', 'class', 'order', 'family', 'genus',
+                'species')[level]
+        fold = join(novel_taxa_simulations_root(root), f'nine-{rank}-iter0')
+        expected = import_taxonomy_to_dict(join(fold, QUERY_TAXA_TSV))
+        ref_ids = set(import_taxonomy_to_dict(join(fold, REF_TAXA_TSV)))
+        info = import_taxonomy_to_dict(join(fold, NOVEL_FOLD_INFO_TSV))
+        return expected, ref_ids, info
+
+    def test_novel_taxa_rank_positions_hold_out_the_named_rank(self):
+        '''Level 6 is novel *species* at the species position of a 9-rank taxonomy.
+
+        Without rank_positions the level is a raw position, so level 6 of a
+        nine-rank taxonomy lands on the family (position 6) -- the old behaviour.
+        '''
+        positions = [1, 2, 4, 5, 6, 7, 8]   # kingdom..species within D;K;P;Sp;...
+        tmp = mkdtemp()
+        try:
+            self._nine_rank_cv_fold(tmp)
+            expected, ref_ids, info = self._novel_fold(tmp, 6, positions)
+            # novel species: only the query's species is held out, and the
+            # expected answer is its genus
+            self.assertEqual(expected, {'q1': 'D;K;P;Sp;C;O;F1;G1'})
+            self.assertEqual(ref_ids, {'r2', 'r3', 'r4'})
+            self.assertEqual(info['level'], '6')
+            self.assertEqual(info['rank'], 'species')
+            self.assertEqual(info['rank_position'], '8')
+            self.assertEqual(info['rank_positions'], '1,2,4,5,6,7,8')
+
+            # novel genus: the whole genus G1 is held out, expected = family
+            expected, ref_ids, info = self._novel_fold(tmp, 5, positions)
+            self.assertEqual(expected, {'q1': 'D;K;P;Sp;C;O;F1'})
+            self.assertEqual(ref_ids, {'r3', 'r4'})
+            self.assertEqual(info['rank_position'], '7')
+        finally:
+            rmtree(tmp)
+
+    def test_novel_taxa_without_rank_positions_is_positional(self):
+        '''No rank_positions: level = position, unchanged for seven-rank databases.'''
+        tmp = mkdtemp()
+        try:
+            self._nine_rank_cv_fold(tmp)
+            expected, ref_ids, info = self._novel_fold(tmp, 6, None)
+            # position 6 of this taxonomy is the family: F1 is held out
+            self.assertEqual(expected, {'q1': 'D;K;P;Sp;C;O'})
+            self.assertEqual(ref_ids, {'r4'})
+            self.assertEqual(info['rank_positions'], '0,1,2,3,4,5,6')
+        finally:
+            rmtree(tmp)
+
+    def test_novel_rank_position_validation(self):
+        self.assertEqual(novel_rank_position(6), 6)
+        self.assertEqual(novel_rank_position(3, [0, 2, 4, 5, 6, 7, 8]), 5)
+        for bad_level in (0, 7):
+            with self.assertRaises(ValueError):
+                novel_rank_position(bad_level)
+        with self.assertRaises(ValueError):
+            novel_rank_position(6, [0, 1, 2, 3, 4, 5])        # not seven
+        with self.assertRaises(ValueError):
+            novel_rank_position(6, [0, 2, 1, 3, 4, 5, 6])     # not increasing
 
     def test_novel_taxa_skips_incomplete_fold_of_same_database(self):
         '''An incomplete fold of the database being processed is skipped loudly.'''
@@ -516,14 +603,14 @@ class EvalFrameworkTests(TestCase):
             self.assertIn('B1-REF-iter1', output)
             # the intact fold was still processed
             self.assertTrue(exists(join(
-                novel_taxa_simulations_root(tmp), 'B1-REF-L6-iter0')))
+                novel_taxa_simulations_root(tmp), 'B1-REF-species-iter0')))
         finally:
             rmtree(tmp)
 
     def _trad_ref_data(self, tmp):
         '''Build the single-database frame used by the trad-CV tests.'''
         copy(join(self.tmpdir, 'ref1.txt'), join(tmp, 'ref1.txt'))
-        qdir = join(tmp, 'B1-REF-L6-iter0')
+        qdir = join(tmp, 'B1-REF-species-iter0')
         makedirs(qdir, exist_ok=True)
         copy(self.query_fp, join(qdir, QUERY_TAXA_TSV))
         ref_data = pd.DataFrame.from_dict(
@@ -628,7 +715,7 @@ class EvalFrameworkTests(TestCase):
             names.append((cross_validated_trad_root,
                           'B1-REF-iter{0}'.format(i)))
             names.append((novel_taxa_simulations_root,
-                          'B1-REF-L6-iter{0}'.format(i)))
+                          'B1-REF-species-iter{0}'.format(i)))
         return names
 
     @staticmethod
@@ -707,7 +794,7 @@ class EvalFrameworkTests(TestCase):
             self.assertFalse(exists(cross_validated_root(capped_tmp)) and
                              glob(join(cross_validated_root(capped_tmp), '*')))
             for i in range(2):
-                name = 'B1-REF-L6-iter{0}'.format(i)
+                name = 'B1-REF-species-iter{0}'.format(i)
                 full = join(novel_taxa_simulations_root(full_tmp), name)
                 capped = join(novel_taxa_simulations_root(capped_tmp), name)
                 self.assertEqual(
@@ -797,7 +884,7 @@ class EvalFrameworkTests(TestCase):
         tmp = mkdtemp()
         try:
             copy(join(self.tmpdir, 'ref1.txt'), join(tmp, 'ref1.txt'))
-            name = 'B1-REF-L6-iter0'
+            name = 'B1-REF-species-iter0'
             qdir = join(tmp, name)
             makedirs(qdir)
             copy(self.query_fp, join(qdir, QUERY_TAXA_TSV))
@@ -827,7 +914,7 @@ class EvalFrameworkTests(TestCase):
                 levelrange=range(6, 5, -1), trim_primers=False,
                 simulation_method='novel-taxa')
             self.assertTrue(exists(join(
-                novel_taxa_simulations_root(tmp), 'B1-REF-L6-iter0')))
+                novel_taxa_simulations_root(tmp), 'B1-REF-species-iter0')))
             self.assertFalse(exists(cross_validated_root(tmp)))
             self.assertFalse(exists(cross_validated_trad_root(tmp)))
         finally:
@@ -837,7 +924,7 @@ class EvalFrameworkTests(TestCase):
         tmp = mkdtemp()
         try:
             copy(join(self.tmpdir, 'ref1.txt'), join(tmp, 'ref1.txt'))
-            name = 'B1-REF-L6-iter0'
+            name = 'B1-REF-species-iter0'
             qdir = join(tmp, name)
             makedirs(qdir)
             copy(self.query_fp, join(qdir, QUERY_TAXA_TSV))
@@ -972,7 +1059,7 @@ class EvalFrameworkTests(TestCase):
         results = novel_taxa_classification_evaluation(
             [self.paramdir], self.tmpdir, join(self.tmpdir, 'summary.txt'),
             test_type='cross-validated')
-        self.assertEqual(results.iloc[0]['Dataset'], 'B1-REF-L6')
+        self.assertEqual(results.iloc[0]['Dataset'], 'B1-REF-species')
         self.assertEqual(int(results.iloc[0]['iteration']), 0)
         self.assertEqual(results.iloc[0]['Method'], 'method1')
         self.assertEqual(results.iloc[0]['Parameters'], 'param1')
@@ -998,7 +1085,7 @@ class EvalFrameworkTests(TestCase):
             test_type='cross-validated')
         pla = extract_per_level_accuracy(results)
         # confirm that method/dataset data propagate properly
-        self.assertEqual(pla['Dataset'].unique(), ['B1-REF-L6'])
+        self.assertEqual(pla['Dataset'].unique(), ['B1-REF-species'])
         self.assertEqual(pla['iteration'].unique(), ['0'])
         self.assertEqual(pla['Method'].unique(), ['method1'])
         self.assertEqual(pla['Parameters'].unique(), ['param1'])
@@ -1247,7 +1334,7 @@ class EvalFrameworkTests(TestCase):
             'lales; f__Lactobacillaceae; g__Pediococcus'])
 
         self.tmpdir = mkdtemp()
-        name = 'B1-REF-L6-iter0'
+        name = 'B1-REF-species-iter0'
         self.query_fp = join(self.tmpdir, name, QUERY_TAXA_TSV)
         self.paramdir = join(self.tmpdir, name, name, 'method1', 'param1')
         self.obs_taxa_fp = join(self.paramdir, QUERY_TAX_ASSIGNMENTS_TXT)

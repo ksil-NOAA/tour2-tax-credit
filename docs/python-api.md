@@ -67,7 +67,9 @@ For the cross-validated and self-validated types every score column holds a leng
 
 `Recall_original` and `F-measure_original` report the original tax-credit scoring, in which overclassification also counted as a false negative. See `metrics.metrics_from_outcomes` for the definitions. **`match_ratio` no longer equals `Recall`** — it equals `Recall_original`; the new `Recall` is `match_ratio / (1 − overclassification_ratio)`.
 
-`classification_accuracy_log.tsv` has one line per query (`dataset`, `level`, `iteration`, `method`, `parameters`, `observed_taxonomy`, `expected_taxonomy`, `result`, `mismatch_level`) followed by the fold's `Precision`, `Recall`, `F-measure`, `Recall_original` and `F-measure_original`. `classification_metrics.tsv` has one row per rank 1–6 (`level`, `rank`) with the identifying columns (`Dataset`, `novel_level`, `iteration`, `Method`, `Parameters`) and every `CLASSIFICATION_METRIC_COLUMNS` entry; it is written for every `test_type`, so novel-taxa results get per-rank scores too.
+For novel-taxa, pass the same `rank_positions` the folds were generated with (see [rank_positions](#rank_positions-novel-taxa-on-taxonomies-other-than-the-standard-seven)).
+
+`classification_accuracy_log.tsv` has one line per query (`dataset`, `level`, `iteration`, `method`, `parameters`, `observed_taxonomy`, `expected_taxonomy`, `result`, `mismatch_level`) followed by the fold's `Precision`, `Recall`, `F-measure`, `Recall_original` and `F-measure_original`. `classification_metrics.tsv` has one row per rank 1–6 (`level`, `rank`) with the identifying columns (`Dataset`, `novel_level`, `novel_rank`, `iteration`, `Method`, `Parameters`) and every `CLASSIFICATION_METRIC_COLUMNS` entry; it is written for every `test_type`, so novel-taxa results get per-rank scores too.
 
 **Loading saved summaries:** `pd.read_csv(summary_fp, index_col=0)`.
 
@@ -90,7 +92,7 @@ This function no longer derives `match_ratio`. It used to take it from `Recall`,
 
 Per-rank classification metrics at levels `1..6` (phylum..species), read from each results directory's `classification_metrics.tsv` and recomputed from `classification_accuracy_log.tsv` when that sidecar is absent (results written before it existed). Every rank is scored independently, by re-classifying each read's observed and expected taxonomy truncated to that rank.
 
-The `_by_fold` form returns one row per directory and level with `Dataset`, `novel_level` (novel-taxa simulation level, `<NA>` otherwise), `iteration`, `Method`, `Parameters`, `level` and every column in `CLASSIFICATION_METRIC_COLS` (the four ratios, the four outcome counts, `n_scored`, the five scores and the four tallies). The other form averages across iterations, grouped by `Dataset`, `novel_level`, `Method`, `Parameters` and `level`.
+The `_by_fold` form returns one row per directory and level with `Dataset`, `novel_level` (novel-taxa simulation level, `<NA>` otherwise), `novel_rank` (its rank name, read from the fold name), `iteration`, `Method`, `Parameters`, `level` and every column in `CLASSIFICATION_METRIC_COLS` (the four ratios, the four outcome counts, `n_scored`, the five scores and the four tallies). The other form averages across iterations, grouped by `Dataset`, `novel_level`, `novel_rank`, `Method`, `Parameters` and `level`. Both take `rank_names=None` (the names the folds were generated with).
 
 ### `select_best_runs(df, metrics, group_cols=("Dataset",), run_cols=("Method", "Parameters"), tolerance=1e-9)`
 
@@ -176,7 +178,7 @@ Simulation and sweep entry points (e.g. `generate_simulated_datasets`, `paramete
 
 ### `recall_simulated_taxa_dirs(data_dir, databases, iterations, ref_seqs=..., ref_taxa=..., max_level=6, min_level=0, multilevel=True)`
 
-Builds ``(dataset_reference_combinations, reference_dbs)`` for taxonomy-assignment parameter sweeps: fold directory names under ``data_dir`` (novel-taxa ``<db>-L<level>-iter<n>`` when ``multilevel=True``, or cross-validated ``<db>-iter<n>`` when ``multilevel=False``) mapped to ``ref_seqs`` / ``ref_taxa`` paths. Pass the appropriate root (e.g. ``novel_taxa_simulations_root(data_dir)`` or ``cross_validated_root(data_dir)``) as the first argument so paths resolve to the simulated tree you generated.
+Builds ``(dataset_reference_combinations, reference_dbs)`` for taxonomy-assignment parameter sweeps: fold directory names under ``data_dir`` (novel-taxa ``<db>-<rank>-iter<n>`` when ``multilevel=True``, with ranks from ``rank_names``, or cross-validated ``<db>-iter<n>`` when ``multilevel=False``) mapped to ``ref_seqs`` / ``ref_taxa`` paths. Pass the appropriate root (e.g. ``novel_taxa_simulations_root(data_dir)`` or ``cross_validated_root(data_dir)``) as the first argument so paths resolve to the simulated tree you generated.
 
 ### `recall_self_validated_dirs(data_dir, databases, ref_seqs=..., ref_taxa=...)`
 
@@ -233,6 +235,16 @@ The cap runs after each database's folds are written, through `cap_fold_queries(
 `validate_max_query_size_per_fold(value)` normalises the setting, returning `None` or a positive int. It raises `ValueError` for a negative number, a float (fractions are no longer accepted), a numeric string or a bool. `generate_simulated_datasets` calls it before doing any work.
 
 Fold contents are rewritten on every call, so a changed value takes effect with no cache flag. Under Tourmaline, snakemake skips `tax_credit_prepare_datasets` on a run that already finished, so delete `.datasets.done` or pass `--forcerun tax_credit_prepare_datasets`. `force_regenerate: true` does neither.
+
+### `rank_positions` (novel-taxa on taxonomies other than the standard seven)
+
+`generate_simulated_datasets(..., levelrange=range(6, 0, -1), rank_positions=None, rank_names=None)` passes both to `generate_novel_sequence_sets`. Novel-taxa levels count the seven scored ranks (1 = phylum … 6 = species), and folds are named by that rank's name from `rank_names` (default `DEFAULT_RANK_NAMES`): `<db>-species-iter<n>` is novel species in every database. Pass the same `rank_names` to `recall_simulated_taxa_dirs` and `novel_taxa_classification_evaluation`. `rank_positions` gives each scored rank's 0-based position in the database's taxonomy, the same seven positions `load_prf` scores, e.g. `[0, 2, 4, 5, 6, 7, 8]` for PR2's `Domain;Supergroup;Division;Subdivision;Class;Order;Family;Genus;Species`.
+
+- `novel_rank_position(level, rank_positions=None)` returns the position a level is held out at: `rank_positions[level]`, or `level` itself when `rank_positions` is `None` (the standard seven, unchanged behaviour). It raises `ValueError` for a level outside 1–6 or positions that are not seven increasing integers.
+- Each level is held out at that position (the query taxonomy is cut there and reference lineages sharing it are removed), and the expected taxonomy is cut to the position just above, which may be an unscored rank (PR2 novel class leaves the subdivision as the deepest known rank).
+- Without `rank_positions`, a nine-rank taxonomy's level 6 lands on position 6 (its family), so pass them for any such database, and score with the same positions (`novel_taxa_classification_evaluation(..., rank_positions={db: positions})`).
+- Every novel fold writes `novel_fold_info.tsv` (`NOVEL_FOLD_INFO_TSV`): `level`, `rank`, `rank_position` and `rank_positions`, so callers can detect folds built for a different layout. Tourmaline's manifest phase does.
+- Call once per database when databases differ, since the positions apply to every database in the dataframe.
 
 ---
 

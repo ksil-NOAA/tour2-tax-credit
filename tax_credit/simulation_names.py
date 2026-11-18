@@ -16,7 +16,14 @@ import re
 from os.path import join
 from typing import NamedTuple
 
-_NOVEL_DATASET_ID_RE = re.compile(r"^(.*)-L(\d+)-iter(\d+)$")
+_NOVEL_DATASET_ID_RE = re.compile(r"^(.+)-([^-/\s]+)-iter(\d+)$")
+_LEGACY_NOVEL_DATASET_ID_RE = re.compile(r"^.+-L\d+-iter\d+$")
+_RANK_NAME_RE = re.compile(r"^[A-Za-z0-9_.]+$")
+
+# The seven scored ranks when no other names are given. Novel-taxa folds are
+# named by the held-out rank's name; its level is its index here (6 = species).
+DEFAULT_RANK_NAMES = ("kingdom", "phylum", "class", "order", "family",
+                      "genus", "species")
 
 # --- Top-level folders under a *data_dir* ----------------------------------
 DIR_CROSS_VALIDATED = "cross-validated"
@@ -27,13 +34,18 @@ DIR_REF_DBS = "ref_dbs"
 
 # --- Glob fragments for discovering fold directories -----------------------
 GLOB_CV_FOLD_DIRS = "*-iter*"
-GLOB_NOVEL_FOLD_DIRS = "*-L*-iter*"
+GLOB_NOVEL_FOLD_DIRS = "*-iter*"
 
 
 class NovelDatasetParts(NamedTuple):
-    """Parsed ``<database>-L<level>-iter<n>`` fold / dataset id."""
+    """Parsed ``<database>-<rank>-iter<n>`` fold / dataset id.
+
+    *rank* is the held-out rank's name and *level* its index among the scored
+    rank names (``species`` is 6 with the default names).
+    """
 
     database: str
+    rank: str
     level: int
     iteration: str
 
@@ -87,25 +99,73 @@ def parse_cv_fold_dirname(basename: str) -> CrossValidatedDatasetParts:
     return CrossValidatedDatasetParts(database, iteration)
 
 
-def format_novel_fold_dirname(database: str, level: int, iteration: int) -> str:
-    """Build novel-taxa fold name ``{db}-L{level}-iter{n}``."""
-    return "{0}-L{1}-iter{2}".format(database, level, iteration)
+def _rank_names(rank_names=None):
+    return tuple(DEFAULT_RANK_NAMES if rank_names is None else rank_names)
 
 
-def parse_novel_dataset_id(dataset_id: str) -> NovelDatasetParts:
-    """Parse ``dataset_id`` matching ``{database}-L{level}-iter{n}``.
+def check_rank_name(rank: str) -> str:
+    """Return *rank* if it can be part of a fold name, else raise ``ValueError``.
 
-    *database* may contain hyphens (e.g. ``B1-REF-L6-iter0``); the level
-    segment is always ``-L<digits>-iter<digits>`` at the end.
+    Novel-taxa fold names are ``<db>-<rank>-iter<n>``, so a rank name may hold
+    only letters, digits, ``_`` and ``.`` -- no hyphen, slash or space.
     """
-    m = _NOVEL_DATASET_ID_RE.match(dataset_id)
-    if not m:
+    rank = str(rank)
+    if not _RANK_NAME_RE.match(rank):
         raise ValueError(
-            "Novel-taxa dataset_id must match {{db}}-L{{level}}-iter{{n}}; "
-            "got {!r}".format(dataset_id)
-        )
-    database, level_s, iteration_s = m.group(1), m.group(2), m.group(3)
-    return NovelDatasetParts(database, int(level_s), iteration_s)
+            "rank names used in novel-taxa fold names may contain only letters, "
+            "digits, '_' and '.'; got {!r}".format(rank))
+    return rank
+
+
+def novel_level_rank(level: int, rank_names=None) -> str:
+    """Name of the rank at *level* (index into *rank_names*; 6 = species)."""
+    names = _rank_names(rank_names)
+    level = int(level)
+    if not 1 <= level < len(names):
+        raise ValueError(
+            "novel-taxa level must be 1..{0} ({1}); got {2}".format(
+                len(names) - 1, ",".join(names), level))
+    return check_rank_name(names[level])
+
+
+def format_novel_fold_dirname(database: str, level: int, iteration: int,
+                              rank_names=None) -> str:
+    """Build novel-taxa fold name ``{db}-{rank}-iter{n}``.
+
+    *level* indexes *rank_names* (default ``DEFAULT_RANK_NAMES``), so level 6
+    gives ``<db>-species-iter<n>``.
+    """
+    rank = novel_level_rank(level, rank_names)
+    return "{0}-{1}-iter{2}".format(database, rank, iteration)
+
+
+def parse_novel_dataset_id(dataset_id: str, rank_names=None) -> NovelDatasetParts:
+    """Parse ``dataset_id`` matching ``{database}-{rank}-iter{n}``.
+
+    *database* may contain hyphens (e.g. ``B1-REF-species-iter0``); the rank
+    is the segment before ``-iter<n>`` and must be one of *rank_names*
+    (default ``DEFAULT_RANK_NAMES``) other than the first. Names written
+    before folds were named by rank (``<db>-L6-iter0``) are rejected with a
+    note to regenerate the datasets.
+    """
+    names = _rank_names(rank_names)
+    m = _NOVEL_DATASET_ID_RE.match(dataset_id)
+    level = None
+    if m:
+        lowered = [name.lower() for name in names]
+        rank = m.group(2)
+        if rank.lower() in lowered[1:]:
+            level = lowered.index(rank.lower())
+    if level is None:
+        hint = ""
+        if _LEGACY_NOVEL_DATASET_ID_RE.match(dataset_id):
+            hint = (" Folds named by level number (-L6-) predate rank-named "
+                    "folds; regenerate the novel-taxa datasets.")
+        raise ValueError(
+            "Novel-taxa dataset_id must match {{db}}-{{rank}}-iter{{n}} with a "
+            "rank among {0}; got {1!r}.{2}".format(",".join(names[1:]),
+                                                  dataset_id, hint))
+    return NovelDatasetParts(m.group(1), names[level], level, m.group(3))
 
 
 def parse_cv_dataset_id(dataset_id: str) -> CrossValidatedDatasetParts:
