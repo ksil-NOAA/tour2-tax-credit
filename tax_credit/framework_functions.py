@@ -1683,9 +1683,12 @@ def load_prf(obs_fp, exp_fp, level=slice(0, 7), sort=True,
     else:
         exp_taxa = load_taxa(exp_fp, level=slice(None), sort=sort)
         obs_taxa = load_taxa(obs_fp, level=slice(None), sort=sort)
-        # more ranks than declared means the positions point at the wrong ranks
+        # more ranks than declared means the positions point at the wrong ranks.
+        # Trailing empty/NA ranks are not ranks (PR2 strings end in ';'), so
+        # count after normalize_taxon, as the rest of the evaluation does.
         n_declared = max(rank_positions) + 1
-        deepest = max((len(t.split(';')) for t in exp_taxa), default=0)
+        deepest = max((len(normalize_taxon(t).split(';')) for t in exp_taxa),
+                      default=0)
         if deepest > n_declared:
             raise ValueError(
                 '{0} holds taxonomies with {1} ranks, but rank_positions '

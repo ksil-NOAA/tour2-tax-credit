@@ -80,6 +80,22 @@ class NovelEvaluationModuleTests(unittest.TestCase):
                 framework_functions.load_prf(
                     obs_fp, exp_fp, rank_positions=[0, 1, 2, 3, 4, 5, 6])
 
+    def test_load_prf_ignores_trailing_empty_rank(self):
+        # PR2 strings end in ';': nine ranks plus an empty tenth field
+        positions = [0, 2, 4, 5, 6, 7, 8]
+        with TemporaryDirectory() as tmp:
+            exp_fp, obs_fp = join(tmp, "exp.tsv"), join(tmp, "obs.tsv")
+            with open(exp_fp, "w") as f:
+                f.write("s1\tD;SG;Div;Sub;C;O;F;G;S;\n")
+                f.write("s2\tD;SG;Div;Sub;C;O;F;G;S;NA\n")
+            with open(obs_fp, "w") as f:
+                f.write("s1\tD;SG;Div;Sub;C;O;F;G;S;\n")
+                f.write("s2\tD;SG;Div\n")
+            exp, obs = framework_functions.load_prf(
+                obs_fp, exp_fp, rank_positions=positions)
+            self.assertEqual(exp, ["D;Div;C;O;F;G;S"] * 2)
+            self.assertEqual(obs, ["D;Div;C;O;F;G;S", "D;Div"])
+
     def test_per_level_ratios_with_internal_na(self):
         # Wrong genus under an NA order: the error belongs at level 5 (genus).
         # Dropping the NA rank would shift it up to level 4 (family).
